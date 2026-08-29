@@ -373,11 +373,16 @@
 
   <script src="qr_generator.js"></script>
   <script type="module">
+    // SUPPLY CHAIN: every import below MUST carry an exact version. This page
+    // handles WIF private keys; an unpinned specifier lets the CDN serve a new
+    // release at page load, so a single compromised publish would run with
+    // access to those keys. ESM imports cannot carry SRI hashes, so the pin is
+    // the only defence short of self-hosting. Never relax one to a range.
     import { Buffer } from 'https://esm.sh/buffer@6.0.3?target=es2022';
     window.Buffer = Buffer;
-    import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@7.0.0-rc.0';
-    import { splitQRs, joinQRs } from 'https://esm.sh/bbqr';
-    import jsQR from 'https://esm.sh/jsqr';
+    import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@7.0.1';
+    import { splitQRs, joinQRs } from 'https://esm.sh/bbqr@1.2.0';
+    import jsQR from 'https://esm.sh/jsqr@1.4.0';
     import * as ecc from 'https://cdn.jsdelivr.net/npm/@bitcoin-js/tiny-secp256k1-asmjs@2.2.3/+esm';
     bitcoin.initEccLib(ecc);
     import BIP32Factory from 'https://esm.sh/bip32@4.0.0?target=es2022';
@@ -1878,7 +1883,7 @@
           const pubkey = bytes.slice(2);          // 32‑byte x‑only key
           return bitcoin.address.toBech32(pubkey, 1, network.bech32);  // bech32m
         }
-      } catch {_/* ignore */ }
+      } catch (e) { /* ignore */ }
 
       return null;   // unknown or wrong‑network script
     }
@@ -1908,11 +1913,64 @@
     function hexToBytes(hex) {
       if (!hex || typeof hex !== 'string') return new Uint8Array();
       if (hex.length % 2 !== 0) throw new Error('Invalid hex string');
+      // parseInt() returns NaN for non-hex, which a Uint8Array silently
+      // coerces to 0 -- a corrupted script that fails only at broadcast.
+      if (!/^[0-9a-fA-F]*$/.test(hex)) throw new Error('Invalid hex string');
       const bytes = new Uint8Array(hex.length / 2);
       for (let i = 0; i < bytes.length; i++) {
         bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
       }
       return bytes;
+    }
+
+    // 33-byte compressed pubkey -> 32-byte x-only (BIP340)
+    function toXOnly(pubkey) {
+      const b = Buffer.from(pubkey);
+      return b.length === 32 ? b : b.slice(1);
+    }
+
+    function isTaprootScript(scriptPubKeyHex) {
+      return (scriptPubKeyHex || '').toLowerCase().startsWith('5120');
+    }
+
+    // Resolves the INTERNAL (untweaked) x-only key for a taproot input, from
+    // whichever source the row has: an explicit pubkey (xpub/HW derivation) or
+    // the WIF itself. Returns null when neither is available.
+    function taprootInternalKey(u, network) {
+      if (u.pubkey) {
+        try { return toXOnly(Buffer.from(u.pubkey, 'hex')); } catch (e) { /* fall through */ }
+      }
+      if (u.wif) {
+        try { return toXOnly(Buffer.from(ECPair.fromWIF(u.wif, network).publicKey)); }
+        catch (e) { /* fall through */ }
+      }
+      return null;
+    }
+
+    // Signs one PSBT input with a WIF, handling the taproot key-path case.
+    // A P2TR key-path spend must be signed with the TWEAKED key, while the
+    // PSBT carries the INTERNAL key in tapInternalKey -- signing taproot with
+    // a raw ECPair (as this code used to) produces an input that can never be
+    // finalized. Throws on failure so callers can report which input failed.
+    function signInputWithWif(psbt, index, wif, network) {
+      const kp = ECPair.fromWIF(wif, network);
+      const input = psbt.data.inputs[index];
+      const spk = input && input.witnessUtxo ? Buffer.from(input.witnessUtxo.script).toString('hex') : '';
+
+      if (isTaprootScript(spk)) {
+        if (!input.tapInternalKey) {
+          throw new Error(
+            'taproot input has no tapInternalKey, so it cannot be signed. ' +
+            'Supply the WIF or the xpub + derivation path for this input.'
+          );
+        }
+        const tweaked = kp.tweak(
+          bitcoin.crypto.taggedHash('TapTweak', toXOnly(Buffer.from(kp.publicKey)))
+        );
+        psbt.signInput(index, tweaked);
+      } else {
+        psbt.signInput(index, kp);
+      }
     }
 
     function createPsbtFromInputs(utxos, outputs, fee, changeAddress) {
@@ -1943,13 +2001,37 @@
           inputData.nonWitnessUtxo = Buffer.from(rawHex, 'hex');
         }
 
-        // Add bip32Derivation if provided (for HW wallet key identification)
+        // Taproot inputs need the internal key: bitcoinjs cannot build the
+        // key-path witness (and finalizeAllInputs throws) without it. This is
+        // required for BOTH WIF and hardware-wallet taproot inputs.
+        // Taproot inputs need the internal key: bitcoinjs cannot build the
+        // key-path witness (and finalizeAllInputs throws) without it. When the
+        // key is not derivable we still build the PSBT -- the user may be
+        // inspecting or combining it -- but the create handler warns first,
+        // and signInputWithWif refuses outright.
+        const isTaproot = isTaprootScript(spk);
+        if (isTaproot) {
+          const internalKey = taprootInternalKey(u, network);
+          if (internalKey) inputData.tapInternalKey = internalKey;
+        }
+
+        // Key identification for HW wallets. Taproot uses tapBip32Derivation
+        // with the x-only key; only pre-taproot inputs use bip32Derivation.
         if (u.xfp && u.pubkey && u.derivationPath) {
-          inputData.bip32Derivation = [{
-            masterFingerprint: Buffer.from(u.xfp, 'hex'),
-            pubkey: Buffer.from(u.pubkey, 'hex'),
-            path: u.derivationPath,
-          }];
+          if (isTaproot) {
+            inputData.tapBip32Derivation = [{
+              masterFingerprint: Buffer.from(u.xfp, 'hex'),
+              pubkey: toXOnly(Buffer.from(u.pubkey, 'hex')),
+              path: u.derivationPath,
+              leafHashes: [],
+            }];
+          } else {
+            inputData.bip32Derivation = [{
+              masterFingerprint: Buffer.from(u.xfp, 'hex'),
+              pubkey: Buffer.from(u.pubkey, 'hex'),
+              path: u.derivationPath,
+            }];
+          }
         }
 
         psbt.addInput(inputData);
@@ -2079,12 +2161,31 @@
             xfp: xfpInput ? xfpInput.value.trim() : '',
             derivationPath: pathInput ? pathInput.value.trim().replace(/[hH]/g, "'") : '',
             pubkey: pubkeyInput ? pubkeyInput.value.trim() : '',
+            // Needed so taproot inputs can resolve their internal key even when
+            // no explicit pubkey field was filled in (the WIF-sweep case).
+            wif: row.getAttribute('data-wif') || '',
           };
         });
         // Warn if any input has pubkey+path but no master fingerprint
         const missingXfp = utxos.filter(u => u.pubkey && u.derivationPath && !u.xfp);
         if (missingXfp.length > 0) {
           const ok = confirm(`${missingXfp.length} input(s) have HW wallet info but no master fingerprint. Your hardware wallet may not recognize these inputs.\n\nContinue anyway?`);
+          if (!ok) return;
+        }
+
+        // A taproot input with no derivable internal key can never be
+        // finalized -- by this tool or any other. Say so before the user
+        // carries the PSBT to a signing device.
+        const net0 = getSelectedNetwork();
+        const taprootNoKey = utxos.filter(
+          u => isTaprootScript(u.scriptPubKey) && !taprootInternalKey(u, net0));
+        if (taprootNoKey.length > 0) {
+          const list = taprootNoKey.map(u => `  ${u.txid}:${u.vout}`).join('\n');
+          const ok = confirm(
+            `${taprootNoKey.length} Taproot input(s) have no public key or WIF, so ` +
+            `their internal key is unknown:\n\n${list}\n\n` +
+            `These inputs CANNOT be signed or finalized. Supply the WIF, or the ` +
+            `xpub + derivation path, for each.\n\nContinue anyway?`);
           if (!ok) return;
         }
 
@@ -2110,16 +2211,21 @@
 
         // WIF inline signing mode
         if (allUtxosHaveWif()) {
-          // Sign each input with its WIF
-          let signed = 0;
+          // Sign each input with its WIF. Failures are collected rather than
+          // swallowed: a silent skip here used to surface only as an opaque
+          // "Can not finalize input" from finalizeAllInputs().
+          const signFailures = [];
           for (let i = 0; i < utxoRows.length; i++) {
             const wifVal = utxoRows[i].getAttribute('data-wif');
             if (!wifVal) continue;
             try {
-              const kp = ECPair.fromWIF(wifVal, net);
-              psbt.signInput(i, kp);
-              signed++;
-            } catch (e) { /* skip inputs that don't match this key */ }
+              signInputWithWif(psbt, i, wifVal, net);
+            } catch (e) {
+              signFailures.push(`input ${i} (${utxos[i].txid}:${utxos[i].vout}): ${e.message}`);
+            }
+          }
+          if (signFailures.length) {
+            throw new Error('Could not sign:\n' + signFailures.join('\n'));
           }
 
           psbt.finalizeAllInputs();
@@ -2241,18 +2347,40 @@
           combined.combine(psbtArray[i]);
         }
 
-        // Sign any WIF inputs that were left unsigned for HW wallet flow
+        // Sign any WIF inputs that were left unsigned for the HW wallet flow.
+        // Match rows to PSBT inputs by txid:vout, NOT by position: a hardware
+        // wallet may return inputs in a different order, and rows can be added
+        // or removed between Create and Combine. Signing by index then applies
+        // a key to the wrong input.
         const utxoRows = document.querySelectorAll('#utxoContainer [data-utxo]');
         const network = getSelectedNetwork();
+
+        const wifByOutpoint = new Map();
+        utxoRows.forEach(row => {
+          const wifVal = row.getAttribute('data-wif');
+          if (!wifVal) return;
+          const inputs = row.querySelectorAll('input');
+          const txid = inputs[0].value.trim().toLowerCase();
+          const vout = parseInt(inputs[1].value);
+          wifByOutpoint.set(`${txid}:${vout}`, wifVal);
+        });
+
         let wifSigned = 0;
-        for (let i = 0; i < utxoRows.length; i++) {
-          const wifVal = utxoRows[i].getAttribute('data-wif');
-          if (!wifVal) continue;
+        const signFailures = [];
+        combined.txInputs.forEach((txIn, i) => {
+          // txIn.hash is internal byte order; reverse it to get the txid
+          const txid = Buffer.from(txIn.hash).reverse().toString('hex');
+          const wifVal = wifByOutpoint.get(`${txid}:${txIn.index}`);
+          if (!wifVal) return;
           try {
-            const kp = ECPair.fromWIF(wifVal, network);
-            combined.signInput(i, kp);
+            signInputWithWif(combined, i, wifVal, network);
             wifSigned++;
-          } catch (e) { /* skip non-matching or already signed */ }
+          } catch (e) {
+            signFailures.push(`input ${i} (${txid}:${txIn.index}): ${e.message}`);
+          }
+        });
+        if (signFailures.length) {
+          throw new Error('Could not sign WIF input(s):\n' + signFailures.join('\n'));
         }
         if (wifSigned > 0) {
           console.log(`[Combine] Signed ${wifSigned} WIF input(s) before finalizing`);
@@ -2283,8 +2411,26 @@
           body: finalTxHex
         });
 
-        const txid = await response.text();
-        document.getElementById('broadcastResult').innerText = "Broadcasted TXID:\n" + txid;
+        const body = (await response.text()).trim();
+
+        // A rejected broadcast still returns a body -- mempool.space answers
+        // HTTP 400 with the node's error string ("min relay fee not met",
+        // "bad-txns-inputs-missingorspent", ...). Printing that as a TXID
+        // reports failure as success, so check the status AND the shape of
+        // the body: a real result is exactly 64 hex characters.
+        if (!response.ok) {
+          document.getElementById('broadcastResult').innerText =
+            `Broadcast REJECTED (HTTP ${response.status}):\n${body}`;
+          return alert(`Broadcast rejected by the node (HTTP ${response.status}):\n\n${body}`);
+        }
+
+        if (!/^[0-9a-fA-F]{64}$/.test(body)) {
+          document.getElementById('broadcastResult').innerText =
+            `Broadcast returned an unexpected response:\n${body}`;
+          return alert(`Broadcast did not return a TXID. The node said:\n\n${body}`);
+        }
+
+        document.getElementById('broadcastResult').innerText = "Broadcasted TXID:\n" + body;
       } catch (err) {
         alert("Broadcast failed: " + err.message);
       }
@@ -2514,6 +2660,7 @@
       window._fn = {
         validateBitcoinAddress, validateScriptPubKey, decodeAddressFromScript,
         hexToBytes, estimateVirtualSize, createPsbtFromInputs, getSelectedNetwork,
+        toXOnly, isTaprootScript, taprootInternalKey, signInputWithWif,
         getMempoolBaseUrl, fetchRawTx, fetchAllNonWitnessUtxos, fetchUtxos,
         fetchFeeRates, rawTxCache,
         colourField, addInput, addFetchedInput, addOutput, updateFeeCalc,
