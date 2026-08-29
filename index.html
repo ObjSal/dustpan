@@ -142,6 +142,14 @@
     .card.hidden { display: none; }
     .fee-presets { display: flex; gap: 0.4rem; margin-top: 0.4rem; margin-bottom: 0.3rem; }
     .fee-presets button { width: auto; padding: 0.3rem 0.7rem; font-size: 0.9rem; }
+    .tx-preview { display: none; margin: 0.8rem 0; }
+    .tx-preview-toggle { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; flex-wrap: wrap; }
+    .tx-preview-toggle h3 { margin: 0; font-size: 1rem; }
+    .tx-preview-chevron { font-size: 0.7rem; color: var(--text-secondary); transition: transform 0.2s; }
+    .tx-preview-summary { color: var(--text-secondary); font-size: 0.85rem; }
+    .tx-preview-link { margin-left: auto; font-size: 0.85rem; white-space: nowrap; }
+    .tx-preview-frame { display: block; width: 100%; height: 320px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; background: #0d1117; margin-top: 0.5rem; }
+    .tx-preview-note { font-size: 0.75rem; color: var(--text-secondary); margin: 0.3rem 0 0; }
     .fee-preset.active, .tip-preset.active, .locktime-preset.active { background: var(--btc-orange); color: #fff; border-color: #e8850f; }
     .utxo-source-label {
       font-size: 0.85rem; color: var(--text-secondary);
@@ -322,6 +330,7 @@
         <summary style="cursor:pointer; color:var(--text-secondary); font-size:0.85rem;">PSBT Hex</summary>
         <pre id="psbtHex" style="font-size:0.7rem; word-break:break-all; max-height:200px; overflow-y:auto; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:4px; user-select:all;"></pre>
       </details>
+      <div id="psbtPreview" class="tx-preview"></div>
       <p style="color:var(--text-secondary);font-size:0.85rem;margin-top:0.5rem;margin-bottom:0.5rem;">Sign this PSBT separately with each wallet (hardware wallet, Bitcoin Core, etc.), then click <strong>Next: Broadcast</strong> to upload and combine the signed copies.</p>
       <div id="psbtActions" style="display:flex; gap:0.5rem; flex-wrap:wrap;">
         <button id="downloadPsbt" class="btn-secondary">Download PSBT</button>
@@ -375,6 +384,7 @@
     </div>
 
     <div id="broadcastSection">
+      <div id="finalTxPreview" class="tx-preview"></div>
       <p style="color:var(--text-secondary);font-size:0.85rem;margin-top:0;">Download the finalized transaction for your records or broadcast it to the Bitcoin network.</p>
       <button id="downloadFinalPsbt" class="btn-secondary">Download Transaction</button>
       <button id="broadcastTx" class="btn-success" style="margin-top:0.5rem;">Broadcast via mempool.space</button>
@@ -455,11 +465,21 @@
         const sizeSpan = document.createElement('span');
         sizeSpan.style.cssText = 'color:var(--text-secondary); white-space:nowrap; font-size:0.82rem;';
         sizeSpan.textContent = `${item.data.length} bytes`;
+        // Inspect this file on its own in the decoder -- useful when a
+        // hardware wallet hands back something unexpected.
+        const inspect = document.createElement('a');
+        inspect.className = 'psbt-inspect';
+        inspect.textContent = 'inspect \u2197';
+        inspect.target = '_blank';
+        inspect.rel = 'noopener noreferrer';
+        inspect.title = 'Open in PSBT Decoder';
+        inspect.style.cssText = 'white-space:nowrap; font-size:0.82rem;';
+        inspect.href = decoderUrl(Buffer.from(item.data).toString('hex'), false);
         const removeBtn = document.createElement('button');
         removeBtn.className = 'remove';
         removeBtn.textContent = '\u00d7';
         removeBtn.onclick = () => removePsbtFromList(idx);
-        row.append(sourceSpan, labelSpan, sizeSpan, removeBtn);
+        row.append(sourceSpan, labelSpan, sizeSpan, inspect, removeBtn);
         list.appendChild(row);
       });
     }
@@ -584,6 +604,8 @@
             document.getElementById('qrScanProgress').textContent = 'Signed transaction scanned!';
             stopQrScanner();
             finalTxHex = data.toLowerCase();
+            finalPsbt = null;
+            renderFinalPreview();
             finalPsbt = null;
             document.getElementById('combinedResult').innerText = finalTxHex;
             // Show broadcast section (already on the broadcast card)
@@ -1447,6 +1469,7 @@
       psbtAccumulator.length = 0;
       renderPsbtList();
       // Clear results
+      renderTxPreview('finalTxPreview', null);
       document.getElementById('combinedResult').innerText = '';
       document.getElementById('broadcastResult').innerText = '';
       // Reset fee rate and re-fetch defaults (auto-selects slow)
@@ -2199,7 +2222,103 @@
       }
     }
 
+    // ---------------- Transaction preview (PSBT Decoder) ----------------
+    // Shows the sibling PSBT Decoder's verdict + money-flow diagram for the
+    // transaction just built (Create card) or finalized (Broadcast card).
+    // Isolation: the decoder runs in an iframe with sandbox="allow-scripts"
+    // and WITHOUT allow-same-origin, so it gets an opaque origin and cannot
+    // read this page's DOM (where WIFs live) even though both sites are
+    // served from the same GitHub Pages host. The transaction is passed in
+    // the URL #fragment, which browsers never send to a server. The only
+    // message accepted back is its rendered height.
+    // The decoder ships with this site as a git submodule (./psbt-decoder),
+    // pinned to a reviewed commit, so the preview cannot change under us the
+    // way a live sibling site could. Same path in dev and on GitHub Pages.
+    const PSBT_DECODER_URL = window.PSBT_DECODER_URL || 'psbt-decoder/';
+    // Open the preview by default only for sweeps small enough that the
+    // chart fits on screen; larger ones start collapsed with the summary.
+    const PREVIEW_OPEN_MAX_INPUTS = 10;
+
+    function decoderNetworkName() {
+      const net = document.getElementById('network').value;
+      return net === 'testnet' ? 'testnet' : net === 'regtest' ? 'regtest' : 'mainnet';
+    }
+
+    function decoderUrl(hex, embed) {
+      const q = new URLSearchParams({ network: decoderNetworkName() });
+      if (embed) q.set('embed', '1');
+      return `${PSBT_DECODER_URL}?${q}#${hex}`;
+    }
+
+    function txPreviewInfo(hex) {
+      try {
+        const isPsbt = hex.toLowerCase().startsWith('70736274ff');
+        const psbt = isPsbt ? bitcoin.Psbt.fromHex(hex) : null;
+        const tx = isPsbt ? null : bitcoin.Transaction.fromHex(hex);
+        const nIn = isPsbt ? psbt.txInputs.length : tx.ins.length;
+        const nOut = isPsbt ? psbt.txOutputs.length : tx.outs.length;
+        const finalized = !isPsbt || psbt.data.inputs.every(i => i.finalScriptWitness || i.finalScriptSig);
+        const summary = `${nIn} input${nIn === 1 ? '' : 's'} \u2192 ${nOut} output${nOut === 1 ? '' : 's'}${finalized ? ' \u00b7 finalized' : ''}`;
+        return { nIn, nOut, finalized, summary };
+      } catch (e) { return { nIn: 0, nOut: 0, finalized: false, summary: '' }; }
+    }
+
+    // The Broadcast preview prefers the finalized PSBT over the raw
+    // transaction: the PSBT still carries witnessUtxo/nonWitnessUtxo, so the
+    // decoder can show input amounts and the real fee. A raw transaction
+    // scanned from a Coldcard Q has no UTXO data, so it falls back to that.
+    function renderFinalPreview() {
+      let hex = finalTxHex;
+      if (finalPsbt) { try { hex = finalPsbt.toHex(); } catch (e) { /* keep raw tx */ } }
+      renderTxPreview('finalTxPreview', hex);
+    }
+
+    function renderTxPreview(containerId, hex) {
+      const box = document.getElementById(containerId);
+      if (!box) return;
+      if (!hex) { box.style.display = 'none'; box.innerHTML = ''; return; }
+      box.innerHTML = `
+        <div class="tx-preview-toggle">
+          <h3>Transaction Preview</h3>
+          <span class="tx-preview-chevron">&#9660;</span>
+          <span class="tx-preview-summary"></span>
+          <a class="tx-preview-link" target="_blank" rel="noopener noreferrer">Full details in PSBT Decoder &#8599;</a>
+        </div>
+        <div class="tx-preview-body">
+          <iframe class="tx-preview-frame" title="Transaction preview (PSBT Decoder)"
+                  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" loading="lazy"></iframe>
+          <p class="tx-preview-note">Verdict and money flow rendered by <a href="${PSBT_DECODER_URL}" target="_blank" rel="noopener noreferrer">PSBT Decoder</a> in an isolated frame. Nothing leaves your browser. Verify every destination address and amount.</p>
+        </div>`;
+      const info = txPreviewInfo(hex);
+      box.querySelector('.tx-preview-summary').textContent = info.summary;
+      box.querySelector('.tx-preview-link').href = decoderUrl(hex, false);
+      box.querySelector('.tx-preview-frame').src = decoderUrl(hex, true);
+      const body = box.querySelector('.tx-preview-body');
+      const chevron = box.querySelector('.tx-preview-chevron');
+      if (info.nIn > PREVIEW_OPEN_MAX_INPUTS) {
+        body.style.display = 'none';
+        chevron.style.transform = 'rotate(-90deg)';
+      }
+      box.querySelector('.tx-preview-toggle').addEventListener('click', (e) => {
+        if (e.target.closest('a')) return;
+        const isOpen = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : '';
+        chevron.style.transform = isOpen ? 'rotate(-90deg)' : '';
+      });
+      box.style.display = 'block';
+    }
+
+    window.addEventListener('message', (e) => {
+      if (!e.data || e.data.type !== 'psbt-decoder:height') return;
+      const h = Number(e.data.height);
+      if (!Number.isFinite(h)) return;
+      document.querySelectorAll('.tx-preview-frame').forEach(f => {
+        if (f.contentWindow === e.source) f.style.height = Math.min(Math.max(h, 160), 1400) + 'px';
+      });
+    });
+
     function hidePsbtResult() {
+      renderTxPreview('psbtPreview', null);
       document.getElementById('psbtResult').style.display = 'none';
       document.getElementById('showQrPsbt').textContent = 'Show QR Code (Air-gap signing)';
       if (window._qrInterval) { clearInterval(window._qrInterval); window._qrInterval = null; }
@@ -2338,6 +2457,7 @@
           document.getElementById('psbtResult').style.display = 'none';
           document.getElementById('wifSignResult').style.display = '';
           document.getElementById('wifSignedTxHex').textContent = finalTxHex;
+          renderFinalPreview();
 
           // Jump to broadcast
           setStep(2);
@@ -2355,6 +2475,7 @@
           console.log('[PSBT] Mixed mode: WIF inputs left unsigned for HW wallet signing');
         }
         document.getElementById('psbtHex').textContent = Buffer.from(psbt.toBuffer()).toString('hex');
+        renderTxPreview('psbtPreview', document.getElementById('psbtHex').textContent);
         document.getElementById('qrDisplay').style.display = 'none';
         if (window._qrInterval) { clearInterval(window._qrInterval); window._qrInterval = null; }
         document.getElementById('wifSignResult').style.display = 'none';
@@ -2517,6 +2638,7 @@
         finalPsbt = combined;
         finalTxHex = combined.extractTransaction().toHex();
         document.getElementById('combinedResult').innerText = finalTxHex;
+        renderFinalPreview();
         psbtAccumulator.length = 0;
         renderPsbtList();
         // Show broadcast section (already on the broadcast card)
@@ -2988,6 +3110,12 @@
         // Tip
         updateTipSummary, recalcTipIfPreset, updateTipAddress, getTipOutputCount,
         get TIP_ADDRESSES() { return TIP_ADDRESSES; },
+        // Transaction preview (PSBT Decoder)
+        renderTxPreview, renderFinalPreview, txPreviewInfo, decoderUrl,
+        get PSBT_DECODER_URL() { return PSBT_DECODER_URL; },
+        get PREVIEW_OPEN_MAX_INPUTS() { return PREVIEW_OPEN_MAX_INPUTS; },
+        set finalPsbt(v) { finalPsbt = v; },
+        set finalTxHex(v) { finalTxHex = v; },
         // Lock time
         validateLocktime, getSelectedLocktime, getLocktimeMode, setLocktimeMode,
         fetchTipHeight, updateLocktimeSummary, locktimeIsFuture, resetLocktime,

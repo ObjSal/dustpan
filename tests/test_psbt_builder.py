@@ -2242,6 +2242,115 @@ def run_tests(page, base_url):
     test("resetAll: locktime back to block mode", page.evaluate("() => window._fn.getLocktimeMode()") == "block")
     test("resetAll: locktime auto-tracking restored", page.evaluate("() => window._fn.locktimeAuto") is True)
 
+    # ========================================================
+    section("41. Transaction Preview (PSBT Decoder submodule)")
+    # ========================================================
+
+    page.select_option("#network", "regtest")
+    test("preview: decoder URL is the bundled submodule",
+         page.evaluate("() => window._fn.PSBT_DECODER_URL") == "psbt-decoder/")
+
+    # Build an unsigned 1-in/1-out PSBT and a finalized copy, plus a raw tx.
+    fx = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        const utxos = [{ txid: 'ab'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }];
+        const outputs = [{ address: p2w.address, value: 90000 }];
+        const unsigned = window._fn.createPsbtFromInputs(utxos, outputs, 0, '').toHex();
+        const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '');
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        psbt.finalizeAllInputs();
+        const big = window._fn.createPsbtFromInputs(
+            Array.from({ length: 11 }, (_, i) => ({ txid: 'cd'.repeat(32), vout: i, value: 100000, scriptPubKey: spk })),
+            outputs, 0, '').toHex();
+        return { unsigned, finalized: psbt.toHex(), raw: psbt.extractTransaction().toHex(), big };
+    }""")
+    info = page.evaluate("(h) => window._fn.txPreviewInfo(h)", fx["unsigned"])
+    test("txPreviewInfo: unsigned PSBT counts", info["nIn"] == 1 and info["nOut"] == 1 and info["finalized"] is False)
+    test("txPreviewInfo: summary text", info["summary"] == "1 input \u2192 1 output", info["summary"])
+    info = page.evaluate("(h) => window._fn.txPreviewInfo(h)", fx["finalized"])
+    test("txPreviewInfo: finalized PSBT flagged", info["finalized"] is True and "finalized" in info["summary"])
+    info = page.evaluate("(h) => window._fn.txPreviewInfo(h)", fx["raw"])
+    test("txPreviewInfo: raw tx is finalized", info["finalized"] is True and info["nIn"] == 1)
+    test("txPreviewInfo: garbage -> empty summary", page.evaluate("() => window._fn.txPreviewInfo('zz').summary") == "")
+
+    # URLs: data in the #fragment only, network param, embed flag on the frame only
+    u = page.evaluate("(h) => ({ full: window._fn.decoderUrl(h, false), embed: window._fn.decoderUrl(h, true) })", fx["unsigned"])
+    test("decoderUrl: full link = submodule + network + #hex",
+         u["full"].startswith("psbt-decoder/?network=regtest#70736274ff") and "embed" not in u["full"], u["full"][:60])
+    test("decoderUrl: embed link carries embed=1", "embed=1" in u["embed"] and u["embed"].endswith(fx["unsigned"]))
+    test("decoderUrl: hex never in the query string", "?" not in u["full"].split("#")[1])
+
+    # Render on the Create card and let the real decoder load from the submodule
+    page.evaluate("(h) => { document.getElementById('psbtResult').style.display = ''; window._fn.renderTxPreview('psbtPreview', h); }", fx["unsigned"])
+    r = page.evaluate("""() => {
+        const box = document.getElementById('psbtPreview');
+        const f = box.querySelector('.tx-preview-frame'); const a = box.querySelector('.tx-preview-link');
+        return { shown: getComputedStyle(box).display, summary: box.querySelector('.tx-preview-summary').textContent,
+                 sandbox: f.getAttribute('sandbox'), src: f.src, href: a.getAttribute('href'), target: a.target, rel: a.rel,
+                 bodyOpen: box.querySelector('.tx-preview-body').style.display !== 'none' };
+    }""")
+    test("preview: container shown", r["shown"] == "block")
+    test("preview: summary shown", r["summary"] == "1 input \u2192 1 output", r["summary"])
+    test("preview: iframe sandboxed without allow-same-origin",
+         r["sandbox"] == "allow-scripts allow-popups allow-popups-to-escape-sandbox", r["sandbox"])
+    test("preview: iframe src is the embed URL", "psbt-decoder/?network=regtest&embed=1#70736274ff" in r["src"], r["src"][:80])
+    test("preview: full-details link opens a new tab safely",
+         r["href"].startswith("psbt-decoder/?network=regtest#") and r["target"] == "_blank" and "noopener" in r["rel"])
+    test("preview: open by default for a small sweep", r["bodyOpen"] is True)
+    try:
+        page.wait_for_function(
+            "() => (document.querySelector('#psbtPreview .tx-preview-frame').style.height || '').endsWith('px')", timeout=15000)
+        loaded = True
+    except Exception:
+        loaded = False
+    h = page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-frame').style.height")
+    test("preview: decoder embed loaded from submodule and reported its height", loaded, f"height={h!r}")
+    test("preview: reported height clamped to [160, 1400]px",
+         loaded and 160 <= int(h[:-2]) <= 1400, h)
+
+    # Collapse / expand via the heading; the link inside the heading does not toggle
+    page.click("#psbtPreview .tx-preview-toggle h3")
+    test("preview: heading click collapses",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-body').style.display") == "none")
+    page.click("#psbtPreview .tx-preview-toggle h3")
+    test("preview: heading click expands again",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-body').style.display") == "")
+
+    # Large sweeps start collapsed
+    page.evaluate("(h) => window._fn.renderTxPreview('psbtPreview', h)", fx["big"])
+    test("preview: >10 inputs starts collapsed",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-body').style.display") == "none")
+    test("preview: collapsed summary still shows counts",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-summary').textContent") == "11 inputs \u2192 1 output")
+
+    # Broadcast preview prefers the finalized PSBT over the raw tx
+    page.evaluate("([raw, fin]) => { window._fn.finalTxHex = raw; window._fn.finalPsbt = null; window._fn.renderFinalPreview(); }", [fx["raw"], fx["finalized"]])
+    href_raw = page.evaluate("() => document.querySelector('#finalTxPreview .tx-preview-link').getAttribute('href')")
+    test("final preview: raw tx used when no PSBT (Coldcard Q scan)", "#0200" in href_raw or "#0100" in href_raw, href_raw[:50])
+    page.evaluate("([raw, fin]) => { window._fn.finalTxHex = raw; window._fn.finalPsbt = window._bitcoin.Psbt.fromHex(fin); window._fn.renderFinalPreview(); }", [fx["raw"], fx["finalized"]])
+    r = page.evaluate("() => ({ href: document.querySelector('#finalTxPreview .tx-preview-link').getAttribute('href'), summary: document.querySelector('#finalTxPreview .tx-preview-summary').textContent })")
+    test("final preview: finalized PSBT preferred (carries amounts)", "#70736274ff" in r["href"], r["href"][:50])
+    test("final preview: summary says finalized", "finalized" in r["summary"], r["summary"])
+
+    # Per-file inspect link in the signed PSBT list
+    page.evaluate("(h) => { window._fn.psbtAccumulator.length = 0; window._fn.addPsbtToList('cc-signed.psbt', 'file', new Uint8Array(window._Buffer.from(h, 'hex'))); }", fx["unsigned"])
+    r = page.evaluate("() => { const a = document.querySelector('#psbtList .psbt-inspect'); return a ? { href: a.getAttribute('href'), target: a.target, rel: a.rel } : null; }")
+    test("psbt list: inspect link present", r is not None)
+    test("psbt list: inspect link opens the decoder with that file's hex",
+         r is not None and r["href"] == "psbt-decoder/?network=regtest#" + fx["unsigned"] and r["target"] == "_blank" and "noopener" in r["rel"])
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; window._fn.renderPsbtList(); }")
+
+    # Cleared with the results they belong to
+    page.evaluate("() => window._fn.hidePsbtResult()")
+    test("hidePsbtResult clears the create preview",
+         page.evaluate("() => { const b = document.getElementById('psbtPreview'); return getComputedStyle(b).display === 'none' && b.innerHTML === ''; }"))
+    page.evaluate("() => window._fn.resetAll()")
+    test("resetAll clears the broadcast preview",
+         page.evaluate("() => { const b = document.getElementById('finalTxPreview'); return getComputedStyle(b).display === 'none' && b.innerHTML === ''; }"))
+
 
 # ============================================================
 # Main
