@@ -15,6 +15,7 @@ Usage:
 
 import json
 import os
+import socket
 import re
 import resource
 import shutil
@@ -43,8 +44,28 @@ class RegtestNode:
     def __init__(self):
         self.datadir = tempfile.mkdtemp(prefix="psbt_regtest_")
         self.process = None
-        self.rpc_port = 18443
+        self.rpc_port = self._pick_rpc_port()
         self.wallet_name = "psbt_faucet"
+
+    @staticmethod
+    def _pick_rpc_port():
+        """
+        18443 unless something else (e.g. an SSH tunnel to another regtest
+        node) already holds it, in which case a free port. Clients read the
+        actual port from /api/health, so nothing else needs to know.
+        Override with PSBT_REGTEST_RPC_PORT.
+        """
+        env = os.environ.get("PSBT_REGTEST_RPC_PORT")
+        if env:
+            return int(env)
+        for candidate in (18443, 0):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", candidate))
+                    return s.getsockname()[1]
+            except OSError:
+                continue
+        return 18443
 
     def _cli(self, *args, wallet=None, timeout=30):
         """Run bitcoin-cli with managed node credentials."""

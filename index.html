@@ -733,6 +733,7 @@
     // - Static server (localhost, no /api/health) → testnet4
     // - GitHub Pages (not localhost) → mainnet
     let serverMode = false;
+    let networkDetected = false;  // true once detectServer() has set #network
     const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
     (async function detectServer() {
       try {
@@ -755,6 +756,7 @@
       networkEl.dispatchEvent(new Event('change'));
       // Update broadcast button label now that serverMode is known
       if (typeof updateBroadcastLabel === 'function') updateBroadcastLabel();
+      networkDetected = true;
     })();
 
     // Cache of txid → full raw transaction hex (for nonWitnessUtxo)
@@ -833,6 +835,15 @@
       }
     }
 
+    // Clear the fetch input after a successful fetch -- but only if it still
+    // holds the value that was fetched. The fetch awaits network round trips,
+    // and the user may already have typed the next address/WIF/xpub into the
+    // field; unconditionally clearing it here would silently discard that.
+    function clearFetchInputIfStill(fetchedValue) {
+      const el = document.getElementById('fetchAddress');
+      if (el.value.trim() === fetchedValue) el.value = '';
+    }
+
     async function fetchUtxos() {
       const address = document.getElementById('fetchAddress').value.trim();
       const statusEl = document.getElementById('fetchStatus');
@@ -890,7 +901,7 @@
         await Promise.allSettled(Array.from(txids).map(txid => fetchRawTx(txid)));
 
         statusEl.textContent = `Added ${utxos.length} UTXO(s) with full transaction data.`;
-        document.getElementById('fetchAddress').value = '';
+        clearFetchInputIfStill(address);
         updateFeeCalc();
         updateOutputPercentages();
         updateStepLayout();
@@ -1085,7 +1096,7 @@
 
         const totalBtc = (totalSatsFound / 1e8).toFixed(8).replace(/\.?0+$/, '');
         statusEl.textContent = `Added ${totalUtxoCount} UTXO(s) (${totalBtc} BTC) from xpub scan.`;
-        document.getElementById('fetchAddress').value = '';
+        clearFetchInputIfStill(xpubStr);
         updateFeeCalc();
         updateOutputPercentages();
         updateStepLayout();
@@ -1933,18 +1944,69 @@
       return (scriptPubKeyHex || '').toLowerCase().startsWith('5120');
     }
 
+    function isP2shScript(scriptPubKeyHex) {
+      const spk = (scriptPubKeyHex || '').toLowerCase();
+      return spk.startsWith('a914') && spk.length === 46 && spk.endsWith('87');
+    }
+
+    // The row's compressed public key, from an explicit (validated) pubkey
+    // field or the WIF. Null when neither is available.
+    function inputPubkey(u, network) {
+      if (u.pubkey && /^[0-9a-f]{66}$/i.test(u.pubkey.trim())) {
+        return Buffer.from(u.pubkey.trim(), 'hex');
+      }
+      if (u.wif) {
+        try { return Buffer.from(ECPair.fromWIF(u.wif, network).publicKey); }
+        catch (e) { /* fall through */ }
+      }
+      return null;
+    }
+
+    // For a P2SH-P2WPKH input, the redeemScript is the P2WPKH program of the
+    // pubkey. Returns null unless hash160(redeemScript) is the hash inside the
+    // P2SH scriptPubKey -- a wrong key must not be attached to the input.
+    function p2shP2wpkhRedeemScript(pubkey, scriptPubKeyHex, network) {
+      if (!pubkey || !isP2shScript(scriptPubKeyHex)) return null;
+      try {
+        const redeem = Buffer.from(bitcoin.payments.p2wpkh({ pubkey, network }).output);
+        const expected = scriptPubKeyHex.toLowerCase().slice(4, 44);
+        const actual = Buffer.from(bitcoin.crypto.hash160(redeem)).toString('hex');
+        return actual === expected ? redeem : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
     // Resolves the INTERNAL (untweaked) x-only key for a taproot input, from
     // whichever source the row has: an explicit pubkey (xpub/HW derivation) or
     // the WIF itself. Returns null when neither is available.
     function taprootInternalKey(u, network) {
-      if (u.pubkey) {
-        try { return toXOnly(Buffer.from(u.pubkey, 'hex')); } catch (e) { /* fall through */ }
+      // Buffer.from(hex) never throws on bad hex -- it silently returns a
+      // short buffer -- so a typo'd pubkey would shadow a valid WIF on the
+      // same row and only surface later as an opaque addInput() error.
+      // Accept a 33-byte compressed key or a 32-byte x-only key, else fall
+      // through to the WIF.
+      if (u.pubkey && /^(?:[0-9a-f]{66}|[0-9a-f]{64})$/i.test(u.pubkey.trim())) {
+        try { return toXOnly(Buffer.from(u.pubkey.trim(), 'hex')); } catch (e) { /* fall through */ }
       }
       if (u.wif) {
         try { return toXOnly(Buffer.from(ECPair.fromWIF(u.wif, network).publicKey)); }
         catch (e) { /* fall through */ }
       }
       return null;
+    }
+
+    // True when a PSBT input already carries a signature (partial or final),
+    // so it must not be signed again.
+    function isInputSigned(input) {
+      if (!input) return false;
+      return !!(
+        (input.partialSig && input.partialSig.length) ||
+        input.tapKeySig ||
+        (input.tapScriptSig && input.tapScriptSig.length) ||
+        input.finalScriptSig ||
+        input.finalScriptWitness
+      );
     }
 
     // Signs one PSBT input with a WIF, handling the taproot key-path case.
@@ -1957,7 +2019,14 @@
       const input = psbt.data.inputs[index];
       const spk = input && input.witnessUtxo ? Buffer.from(input.witnessUtxo.script).toString('hex') : '';
 
-      if (isTaprootScript(spk)) {
+      // Decide taproot the way bitcoinjs does: from the prevout script when
+      // we have it, else from the taproot-only fields. A third-party PSBT
+      // may carry nonWitnessUtxo instead of witnessUtxo for a P2TR input.
+      const isTaproot = isTaprootScript(spk) || !!(input && (
+        input.tapInternalKey ||
+        (input.tapBip32Derivation && input.tapBip32Derivation.length)));
+
+      if (isTaproot) {
         if (!input.tapInternalKey) {
           throw new Error(
             'taproot input has no tapInternalKey, so it cannot be signed. ' +
@@ -1969,6 +2038,12 @@
         );
         psbt.signInput(index, tweaked);
       } else {
+        // An uploaded P2SH-P2WPKH input may lack its redeemScript; attach it
+        // (verified against the scriptPubKey hash) so signing can proceed.
+        if (isP2shScript(spk) && !input.redeemScript) {
+          const redeemScript = p2shP2wpkhRedeemScript(Buffer.from(kp.publicKey), spk, network);
+          if (redeemScript) psbt.updateInput(index, { redeemScript });
+        }
         psbt.signInput(index, kp);
       }
     }
@@ -2002,17 +2077,22 @@
         }
 
         // Taproot inputs need the internal key: bitcoinjs cannot build the
-        // key-path witness (and finalizeAllInputs throws) without it. This is
-        // required for BOTH WIF and hardware-wallet taproot inputs.
-        // Taproot inputs need the internal key: bitcoinjs cannot build the
         // key-path witness (and finalizeAllInputs throws) without it. When the
-        // key is not derivable we still build the PSBT -- the user may be
-        // inspecting or combining it -- but the create handler warns first,
-        // and signInputWithWif refuses outright.
+        // key is not derivable here (address-fetched input, no WIF/xpub) the
+        // PSBT is still built -- an external signer adds the key itself --
+        // and only signInputWithWif refuses.
         const isTaproot = isTaprootScript(spk);
         if (isTaproot) {
           const internalKey = taprootInternalKey(u, network);
           if (internalKey) inputData.tapInternalKey = internalKey;
+        }
+
+        // P2SH-P2WPKH inputs need the redeemScript (the wrapped P2WPKH
+        // program) or bitcoinjs refuses to sign: "scriptPubkey is P2SH but
+        // redeemScript missing". Derivable from the row's pubkey or WIF.
+        if (isP2shScript(spk)) {
+          const redeemScript = p2shP2wpkhRedeemScript(inputPubkey(u, network), spk, network);
+          if (redeemScript) inputData.redeemScript = redeemScript;
         }
 
         // Key identification for HW wallets. Taproot uses tapBip32Derivation
@@ -2170,22 +2250,6 @@
         const missingXfp = utxos.filter(u => u.pubkey && u.derivationPath && !u.xfp);
         if (missingXfp.length > 0) {
           const ok = confirm(`${missingXfp.length} input(s) have HW wallet info but no master fingerprint. Your hardware wallet may not recognize these inputs.\n\nContinue anyway?`);
-          if (!ok) return;
-        }
-
-        // A taproot input with no derivable internal key can never be
-        // finalized -- by this tool or any other. Say so before the user
-        // carries the PSBT to a signing device.
-        const net0 = getSelectedNetwork();
-        const taprootNoKey = utxos.filter(
-          u => isTaprootScript(u.scriptPubKey) && !taprootInternalKey(u, net0));
-        if (taprootNoKey.length > 0) {
-          const list = taprootNoKey.map(u => `  ${u.txid}:${u.vout}`).join('\n');
-          const ok = confirm(
-            `${taprootNoKey.length} Taproot input(s) have no public key or WIF, so ` +
-            `their internal key is unknown:\n\n${list}\n\n` +
-            `These inputs CANNOT be signed or finalized. Supply the WIF, or the ` +
-            `xpub + derivation path, for each.\n\nContinue anyway?`);
           if (!ok) return;
         }
 
@@ -2366,12 +2430,24 @@
         });
 
         let wifSigned = 0;
+        let wifAlreadySigned = 0;
         const signFailures = [];
+        const matched = new Set();
         combined.txInputs.forEach((txIn, i) => {
           // txIn.hash is internal byte order; reverse it to get the txid
           const txid = Buffer.from(txIn.hash).reverse().toString('hex');
-          const wifVal = wifByOutpoint.get(`${txid}:${txIn.index}`);
+          const outpoint = `${txid}:${txIn.index}`;
+          const wifVal = wifByOutpoint.get(outpoint);
           if (!wifVal) return;
+          matched.add(outpoint);
+          // The uploaded PSBT may already carry this input's signature -- the
+          // user signed it externally (tools/sign-psbt.py, another wallet) or
+          // is re-uploading a fully signed file. Signing again makes bip174
+          // throw "duplicate data", which would reject a finalizable PSBT.
+          if (isInputSigned(combined.data.inputs[i])) {
+            wifAlreadySigned++;
+            return;
+          }
           try {
             signInputWithWif(combined, i, wifVal, network);
             wifSigned++;
@@ -2382,8 +2458,20 @@
         if (signFailures.length) {
           throw new Error('Could not sign WIF input(s):\n' + signFailures.join('\n'));
         }
-        if (wifSigned > 0) {
-          console.log(`[Combine] Signed ${wifSigned} WIF input(s) before finalizing`);
+        // A WIF row whose outpoint is not in the uploaded PSBT (row edited
+        // after Create, or a PSBT for a different input set) would otherwise
+        // be skipped silently and fail later as an unexplained
+        // "Can not finalize input #N".
+        const unmatched = [...wifByOutpoint.keys()].filter(k => !matched.has(k));
+        if (unmatched.length) {
+          throw new Error(
+            `${unmatched.length} WIF input(s) on the Create step are not in the ` +
+            `uploaded PSBT, so they cannot be signed:\n  ${unmatched.join('\n  ')}\n` +
+            `Upload the PSBT that was created from these inputs, or remove them.`);
+        }
+        if (wifSigned > 0 || wifAlreadySigned > 0) {
+          console.log(`[Combine] Signed ${wifSigned} WIF input(s) before finalizing` +
+            (wifAlreadySigned ? `, ${wifAlreadySigned} already signed` : ''));
         }
 
         combined.finalizeAllInputs();
@@ -2660,7 +2748,8 @@
       window._fn = {
         validateBitcoinAddress, validateScriptPubKey, decodeAddressFromScript,
         hexToBytes, estimateVirtualSize, createPsbtFromInputs, getSelectedNetwork,
-        toXOnly, isTaprootScript, taprootInternalKey, signInputWithWif,
+        toXOnly, isTaprootScript, taprootInternalKey, signInputWithWif, isInputSigned,
+        isP2shScript, inputPubkey, p2shP2wpkhRedeemScript, clearFetchInputIfStill,
         getMempoolBaseUrl, fetchRawTx, fetchAllNonWitnessUtxos, fetchUtxos,
         fetchFeeRates, rawTxCache,
         colourField, addInput, addFetchedInput, addOutput, updateFeeCalc,
@@ -2688,6 +2777,7 @@
         get finalTxHex() { return finalTxHex; },
         get serverMode() { return serverMode; },
         set serverMode(v) { serverMode = v; },
+        get networkDetected() { return networkDetected; },
       };
       window._bitcoin = bitcoin;
       window._Buffer = Buffer;

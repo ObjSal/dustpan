@@ -489,9 +489,10 @@ def run_tests():
                 page.wait_for_function(
                     "() => document.querySelectorAll('#utxoContainer [data-utxo]').length >= 1",
                     timeout=30000)
-                # Wait for fetch to fully complete
+                # Wait for the fetch to fully complete (the row appears before
+                # the raw-tx fetches finish; the status line is the last step).
                 page.wait_for_function(
-                    "() => !document.getElementById('fetchUtxosBtn').disabled",
+                    "() => document.getElementById('fetchStatus').textContent.includes('full transaction data')",
                     timeout=10000)
 
                 # Fetch WIF UTXOs

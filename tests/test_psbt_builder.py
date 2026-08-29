@@ -1836,6 +1836,257 @@ def run_tests(page, base_url):
     utxo_count = page.evaluate("() => document.querySelectorAll('#utxoContainer [data-utxo]').length")
     test("network switch: UTXOs cleared after confirm", utxo_count == 0)
 
+    # ========================================================
+    section("37. isInputSigned + no create-time taproot warning")
+    # ========================================================
+
+    page.select_option("#network", "regtest")
+    time.sleep(1)
+
+    # A P2WPKH input signed once must report as signed; signing it again is
+    # what bip174 rejects ("duplicate data"), so the combine step must skip it.
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const spk = window._bitcoin.payments.p2wpkh({
+            pubkey: window._Buffer.from(kp.publicKey), network: net }).output;
+        const utxos = [{ txid: 'ab'.repeat(32), vout: 0, value: 100000,
+                         scriptPubKey: window._Buffer.from(spk).toString('hex') }];
+        const dest = window._bitcoin.payments.p2wpkh({
+            pubkey: window._Buffer.from(window._ECPair.makeRandom({ network: net }).publicKey),
+            network: net }).address;
+        const psbt = window._fn.createPsbtFromInputs(utxos, [{ address: dest, value: 90000 }], 0, '');
+        const before = window._fn.isInputSigned(psbt.data.inputs[0]);
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        const after = window._fn.isInputSigned(psbt.data.inputs[0]);
+        let dup = '';
+        try { window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net); } catch (e) { dup = e.message; }
+        psbt.finalizeAllInputs();
+        const fin = window._fn.isInputSigned(psbt.data.inputs[0]);
+        return { before, after, dup, fin, nullish: window._fn.isInputSigned(undefined) };
+    }""")
+    test("isInputSigned: false before signing", r["before"] is False)
+    test("isInputSigned: true after partialSig", r["after"] is True)
+    test("isInputSigned: true after finalize", r["fin"] is True)
+    test("isInputSigned: false for missing input", r["nullish"] is False)
+    test("re-signing a signed input throws (why combine must skip it)",
+         "duplicate" in r["dup"].lower(), f"got '{r['dup']}'")
+
+    # Taproot signed via tapKeySig must also count as signed.
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const addr = window._fn.pubkeyToAddress(window._Buffer.from(kp.publicKey), 'p2tr', net);
+        const spk = window._Buffer.from(window._bitcoin.address.toOutputScript(addr, net)).toString('hex');
+        const utxos = [{ txid: 'cd'.repeat(32), vout: 1, value: 100000, scriptPubKey: spk, wif: kp.toWIF() }];
+        const psbt = window._fn.createPsbtFromInputs(utxos, [{ address: addr, value: 90000 }], 0, '');
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        return window._fn.isInputSigned(psbt.data.inputs[0]);
+    }""")
+    test("isInputSigned: true after taproot tapKeySig", r is True)
+
+    # Address-fetched P2TR (no pubkey, no WIF) is a normal HW-wallet input:
+    # an external signer supplies tapInternalKey. Create must not nag about it.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const addr = window._fn.pubkeyToAddress(window._Buffer.from(kp.publicKey), 'p2tr', net);
+        const spk = window._Buffer.from(window._bitcoin.address.toOutputScript(addr, net)).toString('hex');
+        window._fn.addFetchedInput('ef'.repeat(32), 0, 100000, spk, addr);
+        window._fn.addOutput(null, addr, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    time.sleep(1)
+    test("address-fetched P2TR: no taproot warning dialog at create",
+         not any('taproot' in d.lower() for d in _all_dialogs), f"got {_all_dialogs}")
+    try:
+        page.wait_for_function(
+            "() => (document.getElementById('psbtHex').textContent || '').length > 0",
+            timeout=5000)
+        built = True
+    except Exception:
+        built = False
+    test("address-fetched P2TR: PSBT still built", built, f"dialogs: {_all_dialogs}")
+
+    # ========================================================
+    section("38. taprootInternalKey validation + unmatched WIF rows at combine")
+    # ========================================================
+
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const wif = kp.toWIF();
+        const pub = window._Buffer.from(kp.publicKey).toString('hex');
+        const fromWif = window._Buffer.from(window._fn.toXOnly(window._Buffer.from(kp.publicKey))).toString('hex');
+        const hex = v => v ? window._Buffer.from(v).toString('hex') : null;
+        return {
+            fromWif,
+            badHexWithWif: hex(window._fn.taprootInternalKey({ pubkey: 'zz', wif }, net)),
+            shortHexWithWif: hex(window._fn.taprootInternalKey({ pubkey: pub.slice(0, 65), wif }, net)),
+            badHexNoWif: hex(window._fn.taprootInternalKey({ pubkey: 'zz' }, net)),
+            compressed: hex(window._fn.taprootInternalKey({ pubkey: pub }, net)),
+            xonly: hex(window._fn.taprootInternalKey({ pubkey: pub.slice(2) }, net)),
+            upperPadded: hex(window._fn.taprootInternalKey({ pubkey: ' ' + pub.toUpperCase() + ' ' }, net)),
+        };
+    }""")
+    test("taprootInternalKey: bad hex pubkey falls through to WIF", r["badHexWithWif"] == r["fromWif"])
+    test("taprootInternalKey: truncated pubkey falls through to WIF", r["shortHexWithWif"] == r["fromWif"])
+    test("taprootInternalKey: bad hex and no WIF -> null", r["badHexNoWif"] is None)
+    test("taprootInternalKey: compressed pubkey accepted", r["compressed"] == r["fromWif"])
+    test("taprootInternalKey: x-only pubkey accepted", r["xonly"] == r["fromWif"])
+    test("taprootInternalKey: whitespace/case tolerated", r["upperPadded"] == r["fromWif"])
+
+    # A WIF row whose outpoint is absent from the uploaded PSBT must be
+    # reported by name, not left unsigned to fail as "Can not finalize".
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; }")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: window._Buffer.from(kp.publicKey), network: net });
+        const spk = window._Buffer.from(p2w.output).toString('hex');
+        // Row on the Create step: outpoint 11..11:0 with a WIF
+        window._fn.addInput(null, '11'.repeat(32), 0, 100000, spk);
+        const row = document.querySelector('#utxoContainer [data-utxo]');
+        row.setAttribute('data-wif', kp.toWIF());
+        // Uploaded PSBT spends a DIFFERENT outpoint (22..22:0)
+        const psbt = window._fn.createPsbtFromInputs(
+            [{ txid: '22'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }],
+            [{ address: p2w.address, value: 90000 }], 0, '');
+        window._fn.addPsbtToList('other.psbt', 'file', new Uint8Array(psbt.toBuffer()));
+    }""")
+    page.evaluate("() => { window._fn.showCard('cardBroadcast'); document.getElementById('combineSection').style.display = ''; }")
+    _all_dialogs.clear()
+    page.click("#combinePsbt")
+    time.sleep(1)
+    msg = _all_dialogs[-1] if _all_dialogs else ""
+    test("combine: unmatched WIF row is reported by outpoint",
+         "not in the uploaded PSBT" in msg and ("11" * 32 + ":0") in msg, f"got {_all_dialogs}")
+    test("combine: unmatched WIF row does not surface as 'Can not finalize'",
+         "can not finalize" not in msg.lower(), f"got {msg}")
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; window._fn.renderPsbtList(); window._fn.showCard('cardCreate'); }")
+
+    # ========================================================
+    section("39. P2SH-P2WPKH WIF signing + taproot via nonWitnessUtxo")
+    # ========================================================
+
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const other = window._ECPair.makeRandom({ network: net });
+        const p2sh = window._bitcoin.payments.p2sh({
+            redeem: window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net }),
+            network: net });
+        const spk = B.from(p2sh.output).toString('hex');
+        const dest = window._bitcoin.payments.p2wpkh({ pubkey: B.from(other.publicKey), network: net }).address;
+        const out = { isP2sh: window._fn.isP2shScript(spk) };
+
+        // redeemScript helper: right key -> script, wrong key -> null
+        const rs = window._fn.p2shP2wpkhRedeemScript(B.from(kp.publicKey), spk, net);
+        out.redeemHex = rs ? B.from(rs).toString('hex') : null;
+        out.expectedRedeem = B.from(p2sh.redeem.output).toString('hex');
+        out.wrongKeyNull = window._fn.p2shP2wpkhRedeemScript(B.from(other.publicKey), spk, net) === null;
+
+        // (a) row with WIF: createPsbtFromInputs attaches redeemScript, signs, finalizes
+        const utxosWif = [{ txid: 'aa'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk, wif: kp.toWIF() }];
+        const p1 = window._fn.createPsbtFromInputs(utxosWif, [{ address: dest, value: 90000 }], 0, '');
+        out.hasRedeemAtCreate = !!p1.data.inputs[0].redeemScript;
+        window._fn.signInputWithWif(p1, 0, kp.toWIF(), net);
+        p1.finalizeAllInputs();
+        const tx1 = p1.extractTransaction();
+        out.aSigOk = tx1.ins[0].witness.length === 2 && tx1.ins[0].script.length > 0;
+
+        // (b) row without WIF/pubkey (uploaded PSBT case): signInputWithWif attaches it
+        const utxosBare = [{ txid: 'bb'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }];
+        const p2 = window._fn.createPsbtFromInputs(utxosBare, [{ address: dest, value: 90000 }], 0, '');
+        out.noRedeemAtCreate = !p2.data.inputs[0].redeemScript;
+        window._fn.signInputWithWif(p2, 0, kp.toWIF(), net);
+        out.redeemAddedAtSign = !!p2.data.inputs[0].redeemScript;
+        p2.finalizeAllInputs();
+        out.bFinalized = !!p2.data.inputs[0].finalScriptWitness;
+
+        // (c) wrong WIF on a P2SH input must throw, not attach a bogus redeemScript
+        const p3 = window._fn.createPsbtFromInputs(utxosBare, [{ address: dest, value: 90000 }], 0, '');
+        try { window._fn.signInputWithWif(p3, 0, other.toWIF(), net); out.wrongWifThrew = false; }
+        catch (e) { out.wrongWifThrew = true; }
+        out.wrongWifNoRedeem = !p3.data.inputs[0].redeemScript;
+        return out;
+    }""")
+    test("isP2shScript: detects a914..87", r["isP2sh"] is True)
+    test("p2shP2wpkhRedeemScript: matches bitcoinjs redeem output", r["redeemHex"] == r["expectedRedeem"])
+    test("p2shP2wpkhRedeemScript: wrong key -> null", r["wrongKeyNull"] is True)
+    test("P2SH-P2WPKH WIF row: redeemScript set at create", r["hasRedeemAtCreate"] is True)
+    test("P2SH-P2WPKH WIF row: signs and finalizes (scriptSig + 2-item witness)", r["aSigOk"] is True)
+    test("P2SH-P2WPKH bare row: no redeemScript at create", r["noRedeemAtCreate"] is True)
+    test("P2SH-P2WPKH bare row: signInputWithWif attaches redeemScript", r["redeemAddedAtSign"] is True)
+    test("P2SH-P2WPKH bare row: finalizes after sign", r["bFinalized"] is True)
+    test("P2SH-P2WPKH: wrong WIF throws", r["wrongWifThrew"] is True)
+    test("P2SH-P2WPKH: wrong WIF attaches no redeemScript", r["wrongWifNoRedeem"] is True)
+
+    # Taproot input carried with nonWitnessUtxo (no witnessUtxo): detection
+    # must still go by tapInternalKey and sign with the tweaked key.
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const B = window._Buffer;
+        const bitcoin = window._bitcoin;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const addr = window._fn.pubkeyToAddress(B.from(kp.publicKey), 'p2tr', net);
+        const spk = bitcoin.address.toOutputScript(addr, net);
+        // A real previous transaction paying the P2TR address
+        const prev = new bitcoin.Transaction();
+        prev.version = 2;
+        prev.addInput(B.alloc(32, 1), 0);
+        prev.addOutput(spk, 100000n);
+        const prevHex = prev.toHex();
+        const prevTxid = prev.getId();
+        const internal = window._fn.toXOnly(B.from(kp.publicKey));
+
+        const psbt = new bitcoin.Psbt({ network: net });
+        psbt.addInput({ hash: prevTxid, index: 0, nonWitnessUtxo: B.from(prevHex, 'hex'), tapInternalKey: internal });
+        psbt.addOutput({ address: addr, value: 90000n });
+        const out = { hasWitnessUtxo: !!psbt.data.inputs[0].witnessUtxo };
+        try {
+            window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+            out.signed = !!psbt.data.inputs[0].tapKeySig;
+            // bitcoinjs needs witnessUtxo to FINALIZE taproot; add it now so
+            // finalize proves the signature above was made with the tweaked key.
+            psbt.updateInput(0, { witnessUtxo: { script: spk, value: 100000n } });
+            psbt.finalizeAllInputs();
+            const tx = psbt.extractTransaction();
+            out.witnessLen = tx.ins[0].witness.length;
+            out.sigLen = tx.ins[0].witness[0].length;
+        } catch (e) { out.err = e.message; }
+        return out;
+    }""")
+    test("taproot nonWitnessUtxo-only: bitcoinjs did not add witnessUtxo", r.get("hasWitnessUtxo") is False)
+    test("taproot nonWitnessUtxo-only: signed with tweaked key (tapKeySig)", r.get("signed") is True, f"{r}")
+    test("taproot nonWitnessUtxo-only: finalizes to 1x64-byte witness",
+         r.get("witnessLen") == 1 and r.get("sigLen") == 64, f"{r}")
+
+    # The fetch input is cleared after a fetch only if it still holds the
+    # fetched value -- typing the next key during a slow fetch must survive.
+    r = page.evaluate("""() => {
+        const el = document.getElementById('fetchAddress');
+        el.value = 'fetched-value';
+        window._fn.clearFetchInputIfStill('fetched-value');
+        const cleared = el.value;
+        el.value = 'typed-meanwhile';
+        window._fn.clearFetchInputIfStill('fetched-value');
+        const kept = el.value;
+        el.value = '';
+        return { cleared, kept };
+    }""")
+    test("clearFetchInputIfStill: clears the fetched value", r["cleared"] == "")
+    test("clearFetchInputIfStill: keeps a newer value", r["kept"] == "typed-meanwhile")
+
 
 # ============================================================
 # Main

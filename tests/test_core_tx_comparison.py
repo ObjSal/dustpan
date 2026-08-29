@@ -18,7 +18,9 @@ Coverage, in the order the shapes were requested:
   3. mix and match  (P2WPKH / P2SH-P2WPKH / P2TR / P2PKH on both sides)
   4. 21-in -> 21-out, all native segwit  (the real consolidation shape)
   5. funded end-to-end: sign, finalize, and prove consensus validity with
-     `testmempoolaccept` -- the actual "only the receiver can spend it" check
+     `testmempoolaccept` -- the actual "only the receiver can spend it" check.
+     Accepted sweeps are then broadcast back to the funding wallet, so a run
+     costs only fees; nothing is stranded at the throwaway in-page keys.
 
 Node: the persistent regtest node on the Pi. This suite NEVER spawns a local
 bitcoind (see prime/PLAN-one-regtest-node.md) -- server/server.py would bind
@@ -29,6 +31,7 @@ Usage:
     ... --headed        # visible browser
 """
 
+import hashlib
 import http.server
 import json
 import os
@@ -36,7 +39,6 @@ import socket
 import subprocess
 import sys
 import threading
-import time
 import traceback
 
 from playwright.sync_api import sync_playwright
@@ -77,6 +79,11 @@ _BASE_CLI = [
     f"-rpcuser={RPC_USER}",
     f"-rpcpassword={RPC_PASS}",
 ]
+
+
+# The node's persistent funding wallet. All addresses come from it, so every
+# broadcast sweep returns its coins here -- no per-run wallets are created.
+FUNDING_WALLET = "testwallet"
 
 
 def rpc(*args, wallet=None):
@@ -194,13 +201,14 @@ def compare(page, label, utxos, outputs):
     test(f"{label}: byte-for-byte identical to Core", ours == theirs,
          diff_hex(ours, theirs))
 
-    # txid equality is a cryptographic restatement of the same claim: for an
-    # unsigned (witness-free) transaction the txid is the double-SHA256 of
-    # exactly these bytes, so matching txids cannot happen for differing bytes.
-    if ours == theirs:
-        ours_txid = rpc("decoderawtransaction", ours)["txid"]
-        core_txid = rpc("decoderawtransaction", theirs)["txid"]
-        test(f"{label}: txid matches ({ours_txid[:16]}…)", ours_txid == core_txid)
+    # Independent of the byte comparison: hash OUR bytes locally (an unsigned,
+    # witness-free tx's txid is the reversed double-SHA256 of its serialization)
+    # and compare with the txid Core reports for ITS transaction. This also
+    # runs when the bytes differ, so it can fail on its own.
+    ours_txid = hashlib.sha256(hashlib.sha256(bytes.fromhex(ours)).digest()).digest()[::-1].hex()
+    core_txid = rpc("decoderawtransaction", theirs)["txid"]
+    test(f"{label}: txid matches ({core_txid[:16]}…)", ours_txid == core_txid,
+         f"app {ours_txid} != core {core_txid}")
 
     return ours
 
@@ -252,6 +260,21 @@ def spk_for(address):
     return rpc("validateaddress", address)["scriptPubKey"]
 
 
+def broadcast_sweep(signed_hex, label):
+    """
+    Send an accepted sweep for real. Its outputs pay FUNDING_WALLET addresses,
+    so this returns the test coins (minus fee) instead of stranding them at
+    the throwaway in-page keys.
+    """
+    try:
+        txid = rpc("sendrawtransaction", signed_hex)
+    except RuntimeError as e:
+        test(f"{label} broadcast returns funds to {FUNDING_WALLET}", False, str(e))
+        return
+    ok = isinstance(txid, str) and len(txid) == 64
+    test(f"{label} broadcast returns funds to {FUNDING_WALLET}", ok, str(txid))
+
+
 # A fixed BIP32 test key, so bulk address generation is one RPC instead of
 # hundreds. Core's createrawtransaction keys outputs by address, so it rejects
 # duplicates -- the varint cases below need genuinely distinct addresses.
@@ -277,8 +300,11 @@ def bulk_addresses(count, chain=0):
 
 def run_tests(page, base_url, wallet):
     page.goto(base_url)
-    page.wait_for_function("() => window._fn !== undefined", timeout=20000)
-    page.evaluate("() => { document.getElementById('network').value = 'regtest'; }")
+    # The page's async /api/health probe rewrites #network when it settles
+    # (to 'testnet' on a static server). Setting the value before that lands
+    # gets silently overwritten, so wait for detection first.
+    page.wait_for_function("() => window._fn && window._fn.networkDetected", timeout=20000)
+    page.select_option("#network", "regtest")
     page.on("dialog", lambda d: d.accept())
 
     # --------------------------------------------------------
@@ -415,7 +441,7 @@ def run_funded_sweep(page, base_url, wallet, n=21):
     # Fund each address in one transaction.
     per = 0.001  # BTC
     send_outs = {k["address"]: f"{per:.8f}" for k in keys}
-    funding_txid = rpc("send", json.dumps(send_outs), wallet="testwallet")["txid"]
+    funding_txid = rpc("send", json.dumps(send_outs), wallet=FUNDING_WALLET)["txid"]
     print(f"  funded {n} addresses in {funding_txid[:16]}…")
 
     # gettxout sees the mempool, so an accepted funding tx is enough -- no
@@ -500,6 +526,8 @@ def run_funded_sweep(page, base_url, wallet, n=21):
         test("no input carries a scriptSig (native segwit stays witness-only)",
              all(v["scriptSig"]["hex"] == "" for v in dec["vin"]))
 
+        broadcast_sweep(signed, "funded sweep")
+
 
 def run_taproot_sweep(page, wallet, n=3):
     """
@@ -527,7 +555,7 @@ def run_taproot_sweep(page, wallet, n=3):
          len(keys) == n and all(k["address"].startswith("bcrt1p") for k in keys))
 
     send_outs = {k["address"]: "0.001" for k in keys}
-    txid = rpc("send", json.dumps(send_outs), wallet="testwallet")["txid"]
+    txid = rpc("send", json.dumps(send_outs), wallet=FUNDING_WALLET)["txid"]
     funded = rpc("decoderawtransaction", rpc("getrawtransaction", txid))
 
     utxos = []
@@ -581,6 +609,9 @@ def run_taproot_sweep(page, wallet, n=3):
              for v in dec["vin"]),
          str([[len(w) for w in v["txinwitness"]] for v in dec["vin"]]))
 
+    if res.get("allowed"):
+        broadcast_sweep(signed, "taproot sweep")
+
 
 # ============================================================
 # Main
@@ -593,8 +624,11 @@ def main():
     print(f"node: {NODE_HOST}:{NODE_PORT}  chain={info['chain']}  "
           f"blocks={info['blocks']}")
 
-    wallet = f"jp-cmp-{int(time.time())}"
-    rpc("createwallet", wallet)
+    try:
+        rpc("loadwallet", FUNDING_WALLET)
+    except RuntimeError:
+        pass  # already loaded
+    wallet = FUNDING_WALLET
     print(f"wallet: {wallet}")
 
     port = find_free_port()
@@ -611,13 +645,9 @@ def main():
 
             try:
                 run_tests(page, base_url, wallet)
-                try:
-                    rpc("loadwallet", "testwallet")
-                except RuntimeError:
-                    pass
-                bal = rpc("getbalance", wallet="testwallet")
+                bal = rpc("getbalance", wallet=wallet)
                 if float(bal) < 1:
-                    print("  ! testwallet balance too low, skipping funded sweep")
+                    print(f"  ! {wallet} balance too low, skipping funded sweep")
                 else:
                     run_funded_sweep(page, base_url, wallet)
                     run_taproot_sweep(page, wallet)
@@ -626,10 +656,6 @@ def main():
                 browser.close()
     finally:
         httpd.shutdown()
-        try:
-            rpc("unloadwallet", wallet)
-        except RuntimeError:
-            pass
 
     print(f"\n{'='*64}")
     print(f"  {_pass_count} passed, {_fail_count} failed")
