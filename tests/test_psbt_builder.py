@@ -2087,6 +2087,161 @@ def run_tests(page, base_url):
     test("clearFetchInputIfStill: clears the fetched value", r["cleared"] == "")
     test("clearFetchInputIfStill: keeps a newer value", r["kept"] == "typed-meanwhile")
 
+    # ========================================================
+    section("40. Lock time (anti-fee-sniping): None / Block / Date")
+    # ========================================================
+
+    page.select_option("#network", "regtest")
+    # Let the tip fetch triggered by the network change settle, so a late
+    # response cannot overwrite the tip heights injected below.
+    page.evaluate("() => window._fn.fetchTipHeight()")
+
+    # Default: Block mode, tracking the tip
+    test("locktime: default mode is block", page.evaluate("() => window._fn.getLocktimeMode()") == "block")
+    test("locktime: Block preset active by default",
+         page.evaluate("() => document.querySelector('.locktime-preset[data-mode=\"block\"]').classList.contains('active')"))
+    test("locktime: auto-tracking tip by default", page.evaluate("() => window._fn.locktimeAuto") is True)
+
+    # Inject a known tip and make sure block mode follows it
+    r = page.evaluate("""() => {
+        window._fn.tipHeight = 850000;
+        window._fn.setLocktimeMode('block');
+        return { field: document.getElementById('locktimeBlock').value,
+                 v: window._fn.validateLocktime(),
+                 summary: document.getElementById('locktimeSummary').textContent };
+    }""")
+    test("locktime block: field follows tip", r["field"] == "850000")
+    test("locktime block: value is tip", r["v"].get("value") == 850000, f"{r['v']}")
+    test("locktime block: summary marks current", "850000" in r["summary"] and "current" in r["summary"], r["summary"])
+
+    # Manual edit disables auto-tracking; validation bounds
+    r = page.evaluate("""() => {
+        const el = document.getElementById('locktimeBlock');
+        el.value = '840000'; el.dispatchEvent(new Event('input'));
+        const ok = window._fn.validateLocktime();
+        el.value = '500000000'; el.dispatchEvent(new Event('input'));
+        const tooBig = window._fn.validateLocktime();
+        el.value = '-1'; el.dispatchEvent(new Event('input'));
+        const neg = window._fn.validateLocktime();
+        el.value = '860000'; el.dispatchEvent(new Event('input'));
+        const future = { v: window._fn.validateLocktime(), isFuture: window._fn.locktimeIsFuture(860000),
+                         summary: document.getElementById('locktimeSummary').textContent };
+        return { auto: window._fn.locktimeAuto, ok, tooBig, neg, future };
+    }""")
+    test("locktime block: manual edit disables auto", r["auto"] is False)
+    test("locktime block: 840000 accepted", r["ok"].get("value") == 840000)
+    test("locktime block: >= 500,000,000 rejected", "error" in r["tooBig"])
+    test("locktime block: negative rejected", "error" in r["neg"])
+    test("locktime block: above tip flagged as future", r["future"]["isFuture"] is True and "future" in r["future"]["summary"])
+
+    # Date mode: datetime-local -> unix timestamp (local time)
+    r = page.evaluate("""() => {
+        window._fn.setLocktimeMode('date');
+        const el = document.getElementById('locktimeDate');
+        const prefilled = el.value !== '';
+        el.value = '2023-11-14T22:13'; el.dispatchEvent(new Event('input'));
+        const expected = Math.floor(new Date('2023-11-14T22:13').getTime() / 1000);
+        const v = window._fn.validateLocktime();
+        el.value = '1980-01-01T00:00'; el.dispatchEvent(new Event('input'));
+        const tooEarly = window._fn.validateLocktime();
+        el.value = ''; el.dispatchEvent(new Event('input'));
+        const empty = window._fn.validateLocktime();
+        return { prefilled, v, expected, tooEarly, empty };
+    }""")
+    test("locktime date: prefilled with now on first switch", r["prefilled"] is True)
+    test("locktime date: converts to unix timestamp", r["v"].get("value") == r["expected"], f"{r['v']} vs {r['expected']}")
+    test("locktime date: timestamp is >= 500,000,000", r["v"].get("value", 0) >= 500_000_000)
+    test("locktime date: pre-1985 rejected", "error" in r["tooEarly"])
+    test("locktime date: empty rejected", "error" in r["empty"])
+
+    # None mode
+    r = page.evaluate("""() => { window._fn.setLocktimeMode('none'); return window._fn.validateLocktime(); }""")
+    test("locktime none: value 0", r.get("value") == 0)
+
+    # createPsbtFromInputs honours the parameter (default 0)
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: window._Buffer.from(kp.publicKey), network: net });
+        const spk = window._Buffer.from(p2w.output).toString('hex');
+        const utxos = [{ txid: 'ab'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }];
+        const outputs = [{ address: p2w.address, value: 90000 }];
+        const a = window._fn.createPsbtFromInputs(utxos, outputs, 0, '');
+        const b = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', 850000);
+        const c = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', 1700000000);
+        return { a: a.locktime, b: b.locktime, c: c.locktime, seq: b.txInputs[0].sequence };
+    }""")
+    test("createPsbtFromInputs: default locktime 0", r["a"] == 0)
+    test("createPsbtFromInputs: height locktime set", r["b"] == 850000)
+    test("createPsbtFromInputs: timestamp locktime set", r["c"] == 1700000000)
+    test("createPsbtFromInputs: sequence 0xfffffffd keeps locktime enforceable", r["seq"] == 0xfffffffd)
+
+    # Through the UI: Create with block mode at a known tip stamps the PSBT
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: window._Buffer.from(kp.publicKey), network: net });
+        const spk = window._Buffer.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('cd'.repeat(32), 0, 100000, spk, p2w.address);
+        // Keep the create handler off the network: it awaits
+        // fetchAllNonWitnessUtxos() before the lock time check, and this
+        // static-server regtest path would otherwise query mempool.space.
+        window._fn.rawTxCache.set('cd'.repeat(32), '00');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        window._fn.tipHeight = 850123;
+        document.querySelectorAll('.locktime-preset').forEach(b => b.classList.toggle('active', b.dataset.mode === 'block'));
+        document.getElementById('locktimeBlock').value = '850123';
+    }""")
+    page.fill("#feeRate", "1")
+    page.evaluate("() => { document.getElementById('psbtHex').textContent = ''; }")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => (document.getElementById('psbtHex').textContent || '').length > 0", timeout=5000)
+    except Exception:
+        pass
+    r = page.evaluate("""() => {
+        const hex = document.getElementById('psbtHex').textContent || '';
+        if (!hex) return { built: false };
+        const psbt = window._bitcoin.Psbt.fromHex(hex);
+        return { built: true, locktime: psbt.locktime };
+    }""")
+    test("UI create: PSBT built with block locktime", r.get("built") is True, f"dialogs: {_all_dialogs}")
+    test("UI create: PSBT locktime equals chosen height", r.get("locktime") == 850123, f"{r} dialogs: {_all_dialogs}")
+    test("UI create: no future-locktime confirm at current height",
+         not any('future' in d.lower() for d in _all_dialogs), f"{_all_dialogs}")
+
+    # Future height -> confirm() dialog (auto-accepted by the handler)
+    page.evaluate("""() => {
+        window._fn.tipHeight = 850123;
+        const el = document.getElementById('locktimeBlock');
+        el.value = '850999'; el.dispatchEvent(new Event('input'));
+    }""")
+    pre = page.evaluate("""() => ({ mode: window._fn.getLocktimeMode(), v: window._fn.validateLocktime(),
+        tip: window._fn.tipHeight, auto: window._fn.locktimeAuto, future: window._fn.locktimeIsFuture(850999),
+        btnVisible: !!document.getElementById('createPsbt').offsetParent,
+        card: document.getElementById('cardCreate').style.display })""")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    # The handler awaits fetchAllNonWitnessUtxos() (a network round trip on
+    # this static-server path) before it reaches the lock time check.
+    for _ in range(50):
+        if any('future' in d.lower() for d in _all_dialogs):
+            break
+        time.sleep(0.2)
+    test("UI create: future height shows confirm",
+         any('future' in d.lower() and '850999' in d for d in _all_dialogs), f"{_all_dialogs} pre={pre}")
+
+    # resetAll restores block/auto
+    page.evaluate("() => window._fn.resetAll()")
+    test("resetAll: locktime back to block mode", page.evaluate("() => window._fn.getLocktimeMode()") == "block")
+    test("resetAll: locktime auto-tracking restored", page.evaluate("() => window._fn.locktimeAuto") is True)
+
 
 # ============================================================
 # Main

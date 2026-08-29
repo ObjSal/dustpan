@@ -152,24 +152,24 @@ def section(title):
 # The comparison itself
 # ============================================================
 
-def build_in_page(page, utxos, outputs):
+def build_in_page(page, utxos, outputs, locktime=0):
     """Build via the app and return the serialized unsigned transaction hex."""
     return page.evaluate(
-        """([utxos, outputs]) => {
-            const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '');
+        """([utxos, outputs, locktime]) => {
+            const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', locktime);
             const buf = psbt.data.globalMap.unsignedTx.toBuffer();
             return window._Buffer.from(buf).toString('hex');
         }""",
-        [utxos, outputs],
+        [utxos, outputs, locktime],
     )
 
 
-def build_in_core(utxos, outputs):
+def build_in_core(utxos, outputs, locktime=0):
     """Build the same transaction with Core's createrawtransaction."""
     ins = [{"txid": u["txid"], "vout": u["vout"], "sequence": 0xFFFFFFFD} for u in utxos]
     # Core takes BTC amounts keyed by address, and preserves the given order.
     outs = [{o["address"]: f"{o['value'] / 1e8:.8f}"} for o in outputs]
-    return rpc("createrawtransaction", json.dumps(ins), json.dumps(outs))
+    return rpc("createrawtransaction", json.dumps(ins), json.dumps(outs), locktime)
 
 
 def diff_hex(ours, theirs):
@@ -193,10 +193,10 @@ def diff_hex(ours, theirs):
     return head + "one is a prefix of the other"
 
 
-def compare(page, label, utxos, outputs):
+def compare(page, label, utxos, outputs, locktime=0):
     """Assert the app and Core serialize this transaction identically."""
-    ours = build_in_page(page, utxos, outputs)
-    theirs = build_in_core(utxos, outputs)
+    ours = build_in_page(page, utxos, outputs, locktime)
+    theirs = build_in_core(utxos, outputs, locktime)
 
     test(f"{label}: byte-for-byte identical to Core", ours == theirs,
          diff_hex(ours, theirs))
@@ -321,6 +321,24 @@ def run_tests(page, base_url, wallet):
     utxos2 = [{"txid": fake_txid(2), "vout": 7, "value": 55_555,
                "scriptPubKey": spk_for(addr)}]
     compare(page, "1-in/1-out, vout=7", utxos2, [{"address": addr, "value": 50_000}])
+
+    # --------------------------------------------------------
+    section("1b. nLockTime: height, date, and edge values")
+    # --------------------------------------------------------
+    # The app defaults to the current height (anti-fee-sniping, like Core,
+    # Electrum and Sparrow). Every value must serialize exactly as Core does.
+    tip = int(rpc("getblockcount"))
+    for lt_label, lt in [
+        ("current height", tip),
+        ("height 1", 1),
+        ("max height 499,999,999", 499_999_999),
+        ("date 2023-11-14 (1,700,000,000)", 1_700_000_000),
+        ("max timestamp 0xffffffff", 0xFFFFFFFF),
+    ]:
+        raw = compare(page, f"locktime {lt_label}", utxos, outputs, lt)
+        dec = rpc("decoderawtransaction", raw)
+        test(f"locktime {lt_label}: decodes to {lt}", dec["locktime"] == lt,
+             f"got {dec['locktime']}")
 
     # --------------------------------------------------------
     section("2. Multiple inputs -> multiple outputs")
@@ -477,23 +495,27 @@ def run_funded_sweep(page, base_url, wallet, n=21):
     test(f"per-output amount is above dust ({each} sat)", each > DUST_LIMIT)
     outputs = [{"address": a, "value": each} for a in recipients]
 
-    # Byte-comparison of the real transaction, then sign it in the page.
-    raw = compare(page, f"funded {n}-in/{n}-out", utxos, outputs)
+    # Byte-comparison of the real transaction (with the default
+    # anti-fee-sniping locktime = current height), then sign it in the page.
+    tip = int(rpc("getblockcount"))
+    raw = compare(page, f"funded {n}-in/{n}-out", utxos, outputs, tip)
     assert_output_scripts(page, f"funded {n}-in/{n}-out", outputs, raw)
 
     signed = page.evaluate(
-        """([utxos, outputs]) => {
+        """([utxos, outputs, locktime]) => {
             const net = window._fn.getSelectedNetwork();
-            const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '');
+            const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', locktime);
             for (let i = 0; i < utxos.length; i++) {
                 window._fn.signInputWithWif(psbt, i, utxos[i].wif, net);
             }
             psbt.finalizeAllInputs();
             return psbt.extractTransaction().toHex();
         }""",
-        [utxos, outputs],
+        [utxos, outputs, tip],
     )
     test("all inputs signed and finalized in-page", bool(signed))
+    test(f"signed tx carries locktime {tip} (current height)",
+         rpc("decoderawtransaction", signed)["locktime"] == tip)
 
     # The real question: does the network accept it?
     res = rpc("testmempoolaccept", json.dumps([signed]))[0]
@@ -525,6 +547,25 @@ def run_funded_sweep(page, base_url, wallet, n=21):
 
         test("no input carries a scriptSig (native segwit stays witness-only)",
              all(v["scriptSig"]["hex"] == "" for v in dec["vin"]))
+
+        # Enforcement check: the same sweep with locktime = tip + 100 must be
+        # non-final. (Built from the same inputs; never broadcast.)
+        future = page.evaluate(
+            """([utxos, outputs, locktime]) => {
+                const net = window._fn.getSelectedNetwork();
+                const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', locktime);
+                for (let i = 0; i < utxos.length; i++) {
+                    window._fn.signInputWithWif(psbt, i, utxos[i].wif, net);
+                }
+                psbt.finalizeAllInputs();
+                return psbt.extractTransaction().toHex();
+            }""",
+            [utxos, outputs, tip + 100],
+        )
+        fres = rpc("testmempoolaccept", json.dumps([future]))[0]
+        test("future locktime (tip+100) is rejected as non-final",
+             fres.get("allowed") is False and "non-final" in str(fres.get("reject-reason", "")),
+             f"{fres}")
 
         broadcast_sweep(signed, "funded sweep")
 

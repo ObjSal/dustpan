@@ -142,7 +142,7 @@
     .card.hidden { display: none; }
     .fee-presets { display: flex; gap: 0.4rem; margin-top: 0.4rem; margin-bottom: 0.3rem; }
     .fee-presets button { width: auto; padding: 0.3rem 0.7rem; font-size: 0.9rem; }
-    .fee-preset.active, .tip-preset.active { background: var(--btc-orange); color: #fff; border-color: #e8850f; }
+    .fee-preset.active, .tip-preset.active, .locktime-preset.active { background: var(--btc-orange); color: #fff; border-color: #e8850f; }
     .utxo-source-label {
       font-size: 0.85rem; color: var(--text-secondary);
       background: rgba(247,147,26,0.08); padding: 0.3rem 0.6rem;
@@ -286,6 +286,25 @@
           <input type="number" id="tipSats" placeholder="sats" style="width:120px;flex:0 0 120px;" min="0">
         </div>
         <p style="color:var(--text-secondary);font-size:0.75rem;margin-top:0.2rem;">Support this open-source project</p>
+      </div>
+    </div>
+
+    <div id="locktimeGroup" style="margin-top:1rem;">
+      <div style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;" id="locktimeToggle">
+        <h3 style="margin:0;">Lock Time</h3>
+        <span id="locktimeChevron" style="font-size:0.7rem;color:var(--text-secondary);transition:transform 0.2s;transform:rotate(-90deg);">&#9660;</span>
+        <span id="locktimeSummary" style="color:var(--text-secondary);font-size:0.85rem;"></span>
+      </div>
+      <div id="locktimeBody" style="display:none;">
+        <div class="fee-presets" id="locktimePresets" style="margin-bottom:0.3rem;">
+          <button type="button" class="locktime-preset btn-secondary" data-mode="none">None</button>
+          <button type="button" class="locktime-preset btn-secondary active" data-mode="block">Block</button>
+          <button type="button" class="locktime-preset btn-secondary" data-mode="date">Date</button>
+          <button type="button" id="refreshLocktime" class="btn-secondary" style="font-size:0.85rem;padding:0.3rem 0.5rem;" title="Use current block height">&#x21bb;</button>
+        </div>
+        <input type="number" id="locktimeBlock" placeholder="block height" min="0" max="499999999" step="1" style="max-width:280px;">
+        <input type="datetime-local" id="locktimeDate" style="max-width:280px;display:none;">
+        <p id="locktimeHint" style="color:var(--text-secondary);font-size:0.75rem;margin-top:0.3rem;"></p>
       </div>
     </div>
 
@@ -1454,6 +1473,13 @@
       }
       updateTipAddress();
       updateTipSummary();
+      // Reset lock time to the default (current block height)
+      resetLocktime();
+      if (!window.__TEST_MODE__) {
+        document.getElementById('locktimeBody').style.display = 'none';
+        document.getElementById('locktimeSummary').style.display = '';
+        document.getElementById('locktimeChevron').style.transform = 'rotate(-90deg)';
+      }
       // Reset layout and navigate to Create
       updateStepLayout();
       updateOutputPercentages();
@@ -2048,9 +2074,12 @@
       }
     }
 
-    function createPsbtFromInputs(utxos, outputs, fee, changeAddress) {
+    function createPsbtFromInputs(utxos, outputs, fee, changeAddress, locktime = 0) {
       const network = getSelectedNetwork();
       const psbt    = new bitcoin.Psbt({ network });
+      // nLockTime is enforced because every input uses sequence 0xfffffffd
+      // (not 0xffffffff). 0 means "valid in any block".
+      if (locktime) psbt.setLocktime(locktime);
 
       // ---------------- add inputs ----------------
       let totalInput = 0;
@@ -2268,7 +2297,17 @@
         const fee = totalIn - totalOut;
         if (fee < 0) return alert('Outputs exceed inputs! Reduce output amounts.');
 
-        const psbt = createPsbtFromInputs(utxos, outputs, 0, '');
+        await refreshTipHeightIfStale();
+        const lt = validateLocktime();
+        if (lt.error) return alert(lt.error);
+        if (locktimeIsFuture(lt.value)) {
+          const when = lt.value < LOCKTIME_THRESHOLD
+            ? `block ${lt.value} (current height ${tipHeight})`
+            : new Date(lt.value * 1000).toLocaleString();
+          if (!confirm(`Lock time is in the future: the transaction cannot be broadcast until ${when}.\n\nContinue anyway?`)) return;
+        }
+
+        const psbt = createPsbtFromInputs(utxos, outputs, 0, '', lt.value);
         document.getElementById('feeCalc').textContent = `Transaction fee: ${fee} sats`;
 
         lastPsbt = psbt;
@@ -2610,8 +2649,185 @@
       updateOutputPercentages();
     });
 
-    // Fetch fee rates on load
+    // ---------------- Lock time (anti-fee-sniping) ----------------
+    // Like Bitcoin Core, Electrum and Sparrow, default nLockTime to the
+    // current block height so the transaction cannot be included in a block
+    // below the tip -- a miner reorging the last block to steal its fees
+    // cannot also pull this transaction into the replacement block. Sparrow
+    // exposes the same three choices: None / Block / Date.
+    // Below 500,000,000 nLockTime is a block height (valid from the NEXT
+    // block); at or above it is a UNIX timestamp, enforced against the
+    // median time of the last 11 blocks (BIP 113), so a date is typically
+    // effective about an hour after wall-clock.
+    const LOCKTIME_THRESHOLD = 500000000;
+    let tipHeight = null;          // last fetched chain tip, or null
+    let tipHeightFetchedAt = 0;    // Date.now() of that fetch
+    let tipFetchSeq = 0;           // guards against out-of-order responses
+    let locktimeAuto = true;       // block field still tracks the tip
+
+    const locktimeToggle = document.getElementById('locktimeToggle');
+    const locktimeBody = document.getElementById('locktimeBody');
+    const locktimeSummaryEl = document.getElementById('locktimeSummary');
+    const locktimeChevron = document.getElementById('locktimeChevron');
+    const locktimeBlockEl = document.getElementById('locktimeBlock');
+    const locktimeDateEl = document.getElementById('locktimeDate');
+    const locktimeHintEl = document.getElementById('locktimeHint');
+    locktimeToggle.addEventListener('click', () => {
+      const isOpen = locktimeBody.style.display !== 'none';
+      locktimeBody.style.display = isOpen ? 'none' : '';
+      locktimeSummaryEl.style.display = isOpen ? '' : 'none';
+      locktimeChevron.style.transform = isOpen ? 'rotate(-90deg)' : '';
+    });
+
+    function getLocktimeMode() {
+      const active = document.querySelector('.locktime-preset.active');
+      return active ? active.dataset.mode : 'none';
+    }
+
+    function toLocalDatetimeInput(d) {
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    // Resolves the UI choice to { value } or { error }. value is the
+    // nLockTime to put in the transaction (0 = none).
+    function validateLocktime() {
+      const mode = getLocktimeMode();
+      if (mode === 'none') return { value: 0 };
+      if (mode === 'block') {
+        const raw = locktimeBlockEl.value.trim();
+        if (raw === '') {
+          return tipHeight === null
+            ? { error: 'Lock time: block height unknown (could not fetch the chain tip). Enter one, or choose None.' }
+            : { value: tipHeight };
+        }
+        const h = Number(raw);
+        if (!Number.isInteger(h) || h < 0) return { error: 'Lock time: block height must be a non-negative integer.' };
+        if (h >= LOCKTIME_THRESHOLD) return { error: `Lock time: block height must be below ${LOCKTIME_THRESHOLD}.` };
+        return { value: h };
+      }
+      // date
+      const ms = Date.parse(locktimeDateEl.value);
+      if (Number.isNaN(ms)) return { error: 'Lock time: enter a valid date and time.' };
+      const ts = Math.floor(ms / 1000);
+      if (ts < LOCKTIME_THRESHOLD) return { error: 'Lock time: date must be after 5 Nov 1985.' };
+      if (ts > 0xffffffff) return { error: 'Lock time: date must be before 7 Feb 2106.' };
+      return { value: ts };
+    }
+
+    function getSelectedLocktime() {
+      const r = validateLocktime();
+      return r.error ? 0 : r.value;
+    }
+
+    // True when the chosen lock time is still in the future: the transaction
+    // would be rejected as non-final by every node until then.
+    function locktimeIsFuture(value) {
+      if (!value) return false;
+      if (value < LOCKTIME_THRESHOLD) return tipHeight !== null && value > tipHeight;
+      return value > Math.floor(Date.now() / 1000);
+    }
+
+    function updateLocktimeSummary() {
+      const mode = getLocktimeMode();
+      const r = validateLocktime();
+      const future = !r.error && locktimeIsFuture(r.value) ? ' \u26a0 future' : '';
+      if (mode === 'none') {
+        locktimeSummaryEl.textContent = 'None';
+        locktimeHintEl.textContent = 'No lock time: valid in any block. Forgoes anti-fee-sniping protection.';
+      } else if (mode === 'block') {
+        locktimeSummaryEl.textContent = r.error ? 'Block: --'
+          : `Block ${r.value}${r.value === tipHeight ? ' (current)' : ''}${future}`;
+        locktimeHintEl.textContent = (tipHeight === null ? 'Current height: unknown. ' : `Current height: ${tipHeight}. `) +
+          'Valid from the next block after this height. Default is the current height (anti-fee-sniping).' +
+          (future ? ' This height is in the future: the transaction cannot be broadcast until then.' : '');
+      } else {
+        locktimeSummaryEl.textContent = r.error ? 'Date: --'
+          : `Date ${new Date(r.value * 1000).toLocaleString()}${future}`;
+        locktimeHintEl.textContent = 'Valid once the median time of the last 11 blocks passes this moment ' +
+          '(typically ~1 hour after wall-clock). Not broadcastable until then.';
+      }
+    }
+
+    function setLocktimeMode(mode) {
+      document.querySelectorAll('.locktime-preset').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+      locktimeBlockEl.style.display = mode === 'block' ? '' : 'none';
+      locktimeDateEl.style.display = mode === 'date' ? '' : 'none';
+      document.getElementById('refreshLocktime').style.display = mode === 'block' ? '' : 'none';
+      if (mode === 'block' && locktimeAuto && tipHeight !== null) locktimeBlockEl.value = tipHeight;
+      if (mode === 'date' && !locktimeDateEl.value) locktimeDateEl.value = toLocalDatetimeInput(new Date());
+      updateLocktimeSummary();
+      hidePsbtResult();
+    }
+
+    // Fetches the chain tip height. mempool.space and server.py both answer
+    // /blocks/tip/height with a plain integer.
+    async function fetchTipHeight() {
+      // Only the most recent request may write the result. The page fires a
+      // fetch on load (dropdown still at its default) and again when network
+      // detection settles; a slow mainnet response arriving after the fast
+      // local regtest one used to stamp a mainnet height onto a regtest tx,
+      // which the node rejected as non-final.
+      const seq = ++tipFetchSeq;
+      let h = null;
+      try {
+        const base = getMempoolBaseUrl();
+        const resp = await fetch(`${base}/blocks/tip/height`, { signal: AbortSignal.timeout(5000) });
+        if (!resp.ok) throw new Error(`Tip API error: ${resp.status}`);
+        const parsed = parseInt((await resp.text()).trim(), 10);
+        if (!Number.isInteger(parsed) || parsed < 0) throw new Error('Bad tip height');
+        h = parsed;
+      } catch {
+        h = null;
+      }
+      if (seq !== tipFetchSeq) return tipHeight;  // superseded by a newer request
+      tipHeight = h;
+      tipHeightFetchedAt = h === null ? 0 : Date.now();
+      if (getLocktimeMode() === 'block' && locktimeAuto) {
+        locktimeBlockEl.value = tipHeight === null ? '' : tipHeight;
+      }
+      updateLocktimeSummary();
+      return tipHeight;
+    }
+
+    // Re-fetch before building when the auto height may be stale. Core reads
+    // the height at construction time; a page left open for hours would
+    // otherwise stamp a height far below the tip.
+    async function refreshTipHeightIfStale(maxAgeMs = 10 * 60 * 1000) {
+      if (getLocktimeMode() !== 'block' || !locktimeAuto) return;
+      if (tipHeight !== null && Date.now() - tipHeightFetchedAt < maxAgeMs) return;
+      await fetchTipHeight();
+    }
+
+    function resetLocktime() {
+      locktimeAuto = true;
+      locktimeDateEl.value = '';
+      setLocktimeMode('block');
+      fetchTipHeight();
+    }
+
+    document.querySelectorAll('.locktime-preset').forEach(btn => {
+      btn.addEventListener('click', () => setLocktimeMode(btn.dataset.mode));
+    });
+    document.getElementById('refreshLocktime').addEventListener('click', () => {
+      locktimeAuto = true;
+      fetchTipHeight();
+      hidePsbtResult();
+    });
+    locktimeBlockEl.addEventListener('input', () => {
+      locktimeAuto = false;
+      updateLocktimeSummary();
+      hidePsbtResult();
+    });
+    locktimeDateEl.addEventListener('input', () => {
+      updateLocktimeSummary();
+      hidePsbtResult();
+    });
+    setLocktimeMode('block');
+
+    // Fetch fee rates and chain tip on load
     fetchFeeRates();
+    fetchTipHeight();
 
     // Fetch UTXOs button
     document.getElementById('fetchUtxosBtn').addEventListener('click', fetchUtxos);
@@ -2665,6 +2881,7 @@
       rawTxCache.clear();
       refreshAllScriptLabels();
       fetchFeeRates().catch(() => {});
+      fetchTipHeight();
       updateBroadcastLabel();
       updateTipAddress();
       // Re-validate fetch address
@@ -2771,6 +2988,12 @@
         // Tip
         updateTipSummary, recalcTipIfPreset, updateTipAddress, getTipOutputCount,
         get TIP_ADDRESSES() { return TIP_ADDRESSES; },
+        // Lock time
+        validateLocktime, getSelectedLocktime, getLocktimeMode, setLocktimeMode,
+        fetchTipHeight, updateLocktimeSummary, locktimeIsFuture, resetLocktime,
+        get tipHeight() { return tipHeight; },
+        set tipHeight(v) { tipHeight = v; tipHeightFetchedAt = Date.now(); },
+        get locktimeAuto() { return locktimeAuto; },
         // Step wizard
         setStep, showCard, updateStepLayout, resetAll,
         get psbtAccumulator() { return psbtAccumulator; },
@@ -2788,6 +3011,8 @@
       document.getElementById('feeRateChevron').style.transform = '';
       document.getElementById('tipBody').style.display = '';
       document.getElementById('tipChevron').style.transform = '';
+      document.getElementById('locktimeBody').style.display = '';
+      document.getElementById('locktimeChevron').style.transform = '';
     }
   </script>
 </body>

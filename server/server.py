@@ -283,6 +283,8 @@ class PsbtServerHandler(SimpleHTTPRequestHandler):
             self._handle_health()
         elif path == "/api/v1/fees/recommended":
             self._handle_fees()
+        elif path == "/api/blocks/tip/height":
+            self._handle_tip_height()
         elif re.match(r"^/api/address/.+/utxo$", path):
             address = path.split("/api/address/")[1].rsplit("/utxo", 1)[0]
             self._handle_utxos(address)
@@ -326,6 +328,16 @@ class PsbtServerHandler(SimpleHTTPRequestHandler):
             "fastestFee": 1, "halfHourFee": 1, "hourFee": 1,
             "economyFee": 1, "minimumFee": 1,
         })
+
+    def _handle_tip_height(self):
+        """mempool.space-compatible: plain-text integer."""
+        if not _regtest_node:
+            self._send_text("Regtest not running", 503)
+            return
+        try:
+            self._send_text(_regtest_node._cli("getblockcount"))
+        except Exception as e:
+            self._send_text(str(e), 500)
 
     def _handle_utxos(self, address):
         if not _regtest_node:
