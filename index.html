@@ -142,7 +142,15 @@
     .card.hidden { display: none; }
     .fee-presets { display: flex; gap: 0.4rem; margin-top: 0.4rem; margin-bottom: 0.3rem; }
     .fee-presets button { width: auto; padding: 0.3rem 0.7rem; font-size: 0.9rem; }
-    .fee-preset.active, .tip-preset.active { background: var(--btc-orange); color: #fff; border-color: #e8850f; }
+    .tx-preview { display: none; margin: 0.8rem 0; }
+    .tx-preview-toggle { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; flex-wrap: wrap; }
+    .tx-preview-toggle h3 { margin: 0; font-size: 1rem; }
+    .tx-preview-chevron { font-size: 0.7rem; color: var(--text-secondary); transition: transform 0.2s; }
+    .tx-preview-summary { color: var(--text-secondary); font-size: 0.85rem; }
+    .tx-preview-link { margin-left: auto; font-size: 0.85rem; white-space: nowrap; }
+    .tx-preview-frame { display: block; width: 100%; height: 320px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; background: #0d1117; margin-top: 0.5rem; }
+    .tx-preview-note { font-size: 0.75rem; color: var(--text-secondary); margin: 0.3rem 0 0; }
+    .fee-preset.active, .tip-preset.active, .locktime-preset.active { background: var(--btc-orange); color: #fff; border-color: #e8850f; }
     .utxo-source-label {
       font-size: 0.85rem; color: var(--text-secondary);
       background: rgba(247,147,26,0.08); padding: 0.3rem 0.6rem;
@@ -289,6 +297,25 @@
       </div>
     </div>
 
+    <div id="locktimeGroup" style="margin-top:1rem;">
+      <div style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;" id="locktimeToggle">
+        <h3 style="margin:0;">Lock Time</h3>
+        <span id="locktimeChevron" style="font-size:0.7rem;color:var(--text-secondary);transition:transform 0.2s;transform:rotate(-90deg);">&#9660;</span>
+        <span id="locktimeSummary" style="color:var(--text-secondary);font-size:0.85rem;"></span>
+      </div>
+      <div id="locktimeBody" style="display:none;">
+        <div class="fee-presets" id="locktimePresets" style="margin-bottom:0.3rem;">
+          <button type="button" class="locktime-preset btn-secondary" data-mode="none">None</button>
+          <button type="button" class="locktime-preset btn-secondary active" data-mode="block">Block</button>
+          <button type="button" class="locktime-preset btn-secondary" data-mode="date">Date</button>
+          <button type="button" id="refreshLocktime" class="btn-secondary" style="font-size:0.85rem;padding:0.3rem 0.5rem;" title="Use current block height">&#x21bb;</button>
+        </div>
+        <input type="number" id="locktimeBlock" placeholder="block height" min="0" max="499999999" step="1" style="max-width:280px;">
+        <input type="datetime-local" id="locktimeDate" style="max-width:280px;display:none;">
+        <p id="locktimeHint" style="color:var(--text-secondary);font-size:0.75rem;margin-top:0.3rem;"></p>
+      </div>
+    </div>
+
     <div style="margin-top:1rem;">
       <h3>Outputs</h3>
       <p style="color:var(--text-secondary);font-size:0.85rem;margin-top:0;">Gifting Bitcoin? Create an awesome <a href="https://objsal.github.io/bitcoin-gift-paper-wallet/" target="_blank">Paper Wallet!</a></p>
@@ -303,6 +330,7 @@
         <summary style="cursor:pointer; color:var(--text-secondary); font-size:0.85rem;">PSBT Hex</summary>
         <pre id="psbtHex" style="font-size:0.7rem; word-break:break-all; max-height:200px; overflow-y:auto; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:4px; user-select:all;"></pre>
       </details>
+      <div id="psbtPreview" class="tx-preview"></div>
       <p style="color:var(--text-secondary);font-size:0.85rem;margin-top:0.5rem;margin-bottom:0.5rem;">Sign this PSBT separately with each wallet (hardware wallet, Bitcoin Core, etc.), then click <strong>Next: Broadcast</strong> to upload and combine the signed copies.</p>
       <div id="psbtActions" style="display:flex; gap:0.5rem; flex-wrap:wrap;">
         <button id="downloadPsbt" class="btn-secondary">Download PSBT</button>
@@ -356,6 +384,7 @@
     </div>
 
     <div id="broadcastSection">
+      <div id="finalTxPreview" class="tx-preview"></div>
       <p style="color:var(--text-secondary);font-size:0.85rem;margin-top:0;">Download the finalized transaction for your records or broadcast it to the Bitcoin network.</p>
       <button id="downloadFinalPsbt" class="btn-secondary">Download Transaction</button>
       <button id="broadcastTx" class="btn-success" style="margin-top:0.5rem;">Broadcast via mempool.space</button>
@@ -373,11 +402,16 @@
 
   <script src="qr_generator.js"></script>
   <script type="module">
+    // SUPPLY CHAIN: every import below MUST carry an exact version. This page
+    // handles WIF private keys; an unpinned specifier lets the CDN serve a new
+    // release at page load, so a single compromised publish would run with
+    // access to those keys. ESM imports cannot carry SRI hashes, so the pin is
+    // the only defence short of self-hosting. Never relax one to a range.
     import { Buffer } from 'https://esm.sh/buffer@6.0.3?target=es2022';
     window.Buffer = Buffer;
-    import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@7.0.0-rc.0';
-    import { splitQRs, joinQRs } from 'https://esm.sh/bbqr';
-    import jsQR from 'https://esm.sh/jsqr';
+    import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@7.0.1';
+    import { splitQRs, joinQRs } from 'https://esm.sh/bbqr@1.2.0';
+    import jsQR from 'https://esm.sh/jsqr@1.4.0';
     import * as ecc from 'https://cdn.jsdelivr.net/npm/@bitcoin-js/tiny-secp256k1-asmjs@2.2.3/+esm';
     bitcoin.initEccLib(ecc);
     import BIP32Factory from 'https://esm.sh/bip32@4.0.0?target=es2022';
@@ -431,11 +465,21 @@
         const sizeSpan = document.createElement('span');
         sizeSpan.style.cssText = 'color:var(--text-secondary); white-space:nowrap; font-size:0.82rem;';
         sizeSpan.textContent = `${item.data.length} bytes`;
+        // Inspect this file on its own in the decoder -- useful when a
+        // hardware wallet hands back something unexpected.
+        const inspect = document.createElement('a');
+        inspect.className = 'psbt-inspect';
+        inspect.textContent = 'inspect \u2197';
+        inspect.target = '_blank';
+        inspect.rel = 'noopener noreferrer';
+        inspect.title = 'Open in PSBT Decoder';
+        inspect.style.cssText = 'white-space:nowrap; font-size:0.82rem;';
+        inspect.href = decoderUrl(Buffer.from(item.data).toString('hex'), false);
         const removeBtn = document.createElement('button');
         removeBtn.className = 'remove';
         removeBtn.textContent = '\u00d7';
         removeBtn.onclick = () => removePsbtFromList(idx);
-        row.append(sourceSpan, labelSpan, sizeSpan, removeBtn);
+        row.append(sourceSpan, labelSpan, sizeSpan, inspect, removeBtn);
         list.appendChild(row);
       });
     }
@@ -560,6 +604,8 @@
             document.getElementById('qrScanProgress').textContent = 'Signed transaction scanned!';
             stopQrScanner();
             finalTxHex = data.toLowerCase();
+            finalPsbt = null;
+            renderFinalPreview();
             finalPsbt = null;
             document.getElementById('combinedResult').innerText = finalTxHex;
             // Show broadcast section (already on the broadcast card)
@@ -728,6 +774,7 @@
     // - Static server (localhost, no /api/health) → testnet4
     // - GitHub Pages (not localhost) → mainnet
     let serverMode = false;
+    let networkDetected = false;  // true once detectServer() has set #network
     const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
     (async function detectServer() {
       try {
@@ -750,6 +797,7 @@
       networkEl.dispatchEvent(new Event('change'));
       // Update broadcast button label now that serverMode is known
       if (typeof updateBroadcastLabel === 'function') updateBroadcastLabel();
+      networkDetected = true;
     })();
 
     // Cache of txid → full raw transaction hex (for nonWitnessUtxo)
@@ -828,6 +876,15 @@
       }
     }
 
+    // Clear the fetch input after a successful fetch -- but only if it still
+    // holds the value that was fetched. The fetch awaits network round trips,
+    // and the user may already have typed the next address/WIF/xpub into the
+    // field; unconditionally clearing it here would silently discard that.
+    function clearFetchInputIfStill(fetchedValue) {
+      const el = document.getElementById('fetchAddress');
+      if (el.value.trim() === fetchedValue) el.value = '';
+    }
+
     async function fetchUtxos() {
       const address = document.getElementById('fetchAddress').value.trim();
       const statusEl = document.getElementById('fetchStatus');
@@ -885,7 +942,7 @@
         await Promise.allSettled(Array.from(txids).map(txid => fetchRawTx(txid)));
 
         statusEl.textContent = `Added ${utxos.length} UTXO(s) with full transaction data.`;
-        document.getElementById('fetchAddress').value = '';
+        clearFetchInputIfStill(address);
         updateFeeCalc();
         updateOutputPercentages();
         updateStepLayout();
@@ -1080,7 +1137,7 @@
 
         const totalBtc = (totalSatsFound / 1e8).toFixed(8).replace(/\.?0+$/, '');
         statusEl.textContent = `Added ${totalUtxoCount} UTXO(s) (${totalBtc} BTC) from xpub scan.`;
-        document.getElementById('fetchAddress').value = '';
+        clearFetchInputIfStill(xpubStr);
         updateFeeCalc();
         updateOutputPercentages();
         updateStepLayout();
@@ -1412,6 +1469,7 @@
       psbtAccumulator.length = 0;
       renderPsbtList();
       // Clear results
+      renderTxPreview('finalTxPreview', null);
       document.getElementById('combinedResult').innerText = '';
       document.getElementById('broadcastResult').innerText = '';
       // Reset fee rate and re-fetch defaults (auto-selects slow)
@@ -1438,6 +1496,13 @@
       }
       updateTipAddress();
       updateTipSummary();
+      // Reset lock time to the default (current block height)
+      resetLocktime();
+      if (!window.__TEST_MODE__) {
+        document.getElementById('locktimeBody').style.display = 'none';
+        document.getElementById('locktimeSummary').style.display = '';
+        document.getElementById('locktimeChevron').style.transform = 'rotate(-90deg)';
+      }
       // Reset layout and navigate to Create
       updateStepLayout();
       updateOutputPercentages();
@@ -1878,7 +1943,7 @@
           const pubkey = bytes.slice(2);          // 32‑byte x‑only key
           return bitcoin.address.toBech32(pubkey, 1, network.bech32);  // bech32m
         }
-      } catch {_/* ignore */ }
+      } catch (e) { /* ignore */ }
 
       return null;   // unknown or wrong‑network script
     }
@@ -1908,6 +1973,9 @@
     function hexToBytes(hex) {
       if (!hex || typeof hex !== 'string') return new Uint8Array();
       if (hex.length % 2 !== 0) throw new Error('Invalid hex string');
+      // parseInt() returns NaN for non-hex, which a Uint8Array silently
+      // coerces to 0 -- a corrupted script that fails only at broadcast.
+      if (!/^[0-9a-fA-F]*$/.test(hex)) throw new Error('Invalid hex string');
       const bytes = new Uint8Array(hex.length / 2);
       for (let i = 0; i < bytes.length; i++) {
         bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -1915,9 +1983,126 @@
       return bytes;
     }
 
-    function createPsbtFromInputs(utxos, outputs, fee, changeAddress) {
+    // 33-byte compressed pubkey -> 32-byte x-only (BIP340)
+    function toXOnly(pubkey) {
+      const b = Buffer.from(pubkey);
+      return b.length === 32 ? b : b.slice(1);
+    }
+
+    function isTaprootScript(scriptPubKeyHex) {
+      return (scriptPubKeyHex || '').toLowerCase().startsWith('5120');
+    }
+
+    function isP2shScript(scriptPubKeyHex) {
+      const spk = (scriptPubKeyHex || '').toLowerCase();
+      return spk.startsWith('a914') && spk.length === 46 && spk.endsWith('87');
+    }
+
+    // The row's compressed public key, from an explicit (validated) pubkey
+    // field or the WIF. Null when neither is available.
+    function inputPubkey(u, network) {
+      if (u.pubkey && /^[0-9a-f]{66}$/i.test(u.pubkey.trim())) {
+        return Buffer.from(u.pubkey.trim(), 'hex');
+      }
+      if (u.wif) {
+        try { return Buffer.from(ECPair.fromWIF(u.wif, network).publicKey); }
+        catch (e) { /* fall through */ }
+      }
+      return null;
+    }
+
+    // For a P2SH-P2WPKH input, the redeemScript is the P2WPKH program of the
+    // pubkey. Returns null unless hash160(redeemScript) is the hash inside the
+    // P2SH scriptPubKey -- a wrong key must not be attached to the input.
+    function p2shP2wpkhRedeemScript(pubkey, scriptPubKeyHex, network) {
+      if (!pubkey || !isP2shScript(scriptPubKeyHex)) return null;
+      try {
+        const redeem = Buffer.from(bitcoin.payments.p2wpkh({ pubkey, network }).output);
+        const expected = scriptPubKeyHex.toLowerCase().slice(4, 44);
+        const actual = Buffer.from(bitcoin.crypto.hash160(redeem)).toString('hex');
+        return actual === expected ? redeem : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Resolves the INTERNAL (untweaked) x-only key for a taproot input, from
+    // whichever source the row has: an explicit pubkey (xpub/HW derivation) or
+    // the WIF itself. Returns null when neither is available.
+    function taprootInternalKey(u, network) {
+      // Buffer.from(hex) never throws on bad hex -- it silently returns a
+      // short buffer -- so a typo'd pubkey would shadow a valid WIF on the
+      // same row and only surface later as an opaque addInput() error.
+      // Accept a 33-byte compressed key or a 32-byte x-only key, else fall
+      // through to the WIF.
+      if (u.pubkey && /^(?:[0-9a-f]{66}|[0-9a-f]{64})$/i.test(u.pubkey.trim())) {
+        try { return toXOnly(Buffer.from(u.pubkey.trim(), 'hex')); } catch (e) { /* fall through */ }
+      }
+      if (u.wif) {
+        try { return toXOnly(Buffer.from(ECPair.fromWIF(u.wif, network).publicKey)); }
+        catch (e) { /* fall through */ }
+      }
+      return null;
+    }
+
+    // True when a PSBT input already carries a signature (partial or final),
+    // so it must not be signed again.
+    function isInputSigned(input) {
+      if (!input) return false;
+      return !!(
+        (input.partialSig && input.partialSig.length) ||
+        input.tapKeySig ||
+        (input.tapScriptSig && input.tapScriptSig.length) ||
+        input.finalScriptSig ||
+        input.finalScriptWitness
+      );
+    }
+
+    // Signs one PSBT input with a WIF, handling the taproot key-path case.
+    // A P2TR key-path spend must be signed with the TWEAKED key, while the
+    // PSBT carries the INTERNAL key in tapInternalKey -- signing taproot with
+    // a raw ECPair (as this code used to) produces an input that can never be
+    // finalized. Throws on failure so callers can report which input failed.
+    function signInputWithWif(psbt, index, wif, network) {
+      const kp = ECPair.fromWIF(wif, network);
+      const input = psbt.data.inputs[index];
+      const spk = input && input.witnessUtxo ? Buffer.from(input.witnessUtxo.script).toString('hex') : '';
+
+      // Decide taproot the way bitcoinjs does: from the prevout script when
+      // we have it, else from the taproot-only fields. A third-party PSBT
+      // may carry nonWitnessUtxo instead of witnessUtxo for a P2TR input.
+      const isTaproot = isTaprootScript(spk) || !!(input && (
+        input.tapInternalKey ||
+        (input.tapBip32Derivation && input.tapBip32Derivation.length)));
+
+      if (isTaproot) {
+        if (!input.tapInternalKey) {
+          throw new Error(
+            'taproot input has no tapInternalKey, so it cannot be signed. ' +
+            'Supply the WIF or the xpub + derivation path for this input.'
+          );
+        }
+        const tweaked = kp.tweak(
+          bitcoin.crypto.taggedHash('TapTweak', toXOnly(Buffer.from(kp.publicKey)))
+        );
+        psbt.signInput(index, tweaked);
+      } else {
+        // An uploaded P2SH-P2WPKH input may lack its redeemScript; attach it
+        // (verified against the scriptPubKey hash) so signing can proceed.
+        if (isP2shScript(spk) && !input.redeemScript) {
+          const redeemScript = p2shP2wpkhRedeemScript(Buffer.from(kp.publicKey), spk, network);
+          if (redeemScript) psbt.updateInput(index, { redeemScript });
+        }
+        psbt.signInput(index, kp);
+      }
+    }
+
+    function createPsbtFromInputs(utxos, outputs, fee, changeAddress, locktime = 0) {
       const network = getSelectedNetwork();
       const psbt    = new bitcoin.Psbt({ network });
+      // nLockTime is enforced because every input uses sequence 0xfffffffd
+      // (not 0xffffffff). 0 means "valid in any block".
+      if (locktime) psbt.setLocktime(locktime);
 
       // ---------------- add inputs ----------------
       let totalInput = 0;
@@ -1943,13 +2128,42 @@
           inputData.nonWitnessUtxo = Buffer.from(rawHex, 'hex');
         }
 
-        // Add bip32Derivation if provided (for HW wallet key identification)
+        // Taproot inputs need the internal key: bitcoinjs cannot build the
+        // key-path witness (and finalizeAllInputs throws) without it. When the
+        // key is not derivable here (address-fetched input, no WIF/xpub) the
+        // PSBT is still built -- an external signer adds the key itself --
+        // and only signInputWithWif refuses.
+        const isTaproot = isTaprootScript(spk);
+        if (isTaproot) {
+          const internalKey = taprootInternalKey(u, network);
+          if (internalKey) inputData.tapInternalKey = internalKey;
+        }
+
+        // P2SH-P2WPKH inputs need the redeemScript (the wrapped P2WPKH
+        // program) or bitcoinjs refuses to sign: "scriptPubkey is P2SH but
+        // redeemScript missing". Derivable from the row's pubkey or WIF.
+        if (isP2shScript(spk)) {
+          const redeemScript = p2shP2wpkhRedeemScript(inputPubkey(u, network), spk, network);
+          if (redeemScript) inputData.redeemScript = redeemScript;
+        }
+
+        // Key identification for HW wallets. Taproot uses tapBip32Derivation
+        // with the x-only key; only pre-taproot inputs use bip32Derivation.
         if (u.xfp && u.pubkey && u.derivationPath) {
-          inputData.bip32Derivation = [{
-            masterFingerprint: Buffer.from(u.xfp, 'hex'),
-            pubkey: Buffer.from(u.pubkey, 'hex'),
-            path: u.derivationPath,
-          }];
+          if (isTaproot) {
+            inputData.tapBip32Derivation = [{
+              masterFingerprint: Buffer.from(u.xfp, 'hex'),
+              pubkey: toXOnly(Buffer.from(u.pubkey, 'hex')),
+              path: u.derivationPath,
+              leafHashes: [],
+            }];
+          } else {
+            inputData.bip32Derivation = [{
+              masterFingerprint: Buffer.from(u.xfp, 'hex'),
+              pubkey: Buffer.from(u.pubkey, 'hex'),
+              path: u.derivationPath,
+            }];
+          }
         }
 
         psbt.addInput(inputData);
@@ -2008,7 +2222,103 @@
       }
     }
 
+    // ---------------- Transaction preview (PSBT Decoder) ----------------
+    // Shows the sibling PSBT Decoder's verdict + money-flow diagram for the
+    // transaction just built (Create card) or finalized (Broadcast card).
+    // Isolation: the decoder runs in an iframe with sandbox="allow-scripts"
+    // and WITHOUT allow-same-origin, so it gets an opaque origin and cannot
+    // read this page's DOM (where WIFs live) even though both sites are
+    // served from the same GitHub Pages host. The transaction is passed in
+    // the URL #fragment, which browsers never send to a server. The only
+    // message accepted back is its rendered height.
+    // The decoder ships with this site as a git submodule (./psbt-decoder),
+    // pinned to a reviewed commit, so the preview cannot change under us the
+    // way a live sibling site could. Same path in dev and on GitHub Pages.
+    const PSBT_DECODER_URL = window.PSBT_DECODER_URL || 'psbt-decoder/';
+    // Open the preview by default only for sweeps small enough that the
+    // chart fits on screen; larger ones start collapsed with the summary.
+    const PREVIEW_OPEN_MAX_INPUTS = 10;
+
+    function decoderNetworkName() {
+      const net = document.getElementById('network').value;
+      return net === 'testnet' ? 'testnet' : net === 'regtest' ? 'regtest' : 'mainnet';
+    }
+
+    function decoderUrl(hex, embed) {
+      const q = new URLSearchParams({ network: decoderNetworkName() });
+      if (embed) q.set('embed', '1');
+      return `${PSBT_DECODER_URL}?${q}#${hex}`;
+    }
+
+    function txPreviewInfo(hex) {
+      try {
+        const isPsbt = hex.toLowerCase().startsWith('70736274ff');
+        const psbt = isPsbt ? bitcoin.Psbt.fromHex(hex) : null;
+        const tx = isPsbt ? null : bitcoin.Transaction.fromHex(hex);
+        const nIn = isPsbt ? psbt.txInputs.length : tx.ins.length;
+        const nOut = isPsbt ? psbt.txOutputs.length : tx.outs.length;
+        const finalized = !isPsbt || psbt.data.inputs.every(i => i.finalScriptWitness || i.finalScriptSig);
+        const summary = `${nIn} input${nIn === 1 ? '' : 's'} \u2192 ${nOut} output${nOut === 1 ? '' : 's'}${finalized ? ' \u00b7 finalized' : ''}`;
+        return { nIn, nOut, finalized, summary };
+      } catch (e) { return { nIn: 0, nOut: 0, finalized: false, summary: '' }; }
+    }
+
+    // The Broadcast preview prefers the finalized PSBT over the raw
+    // transaction: the PSBT still carries witnessUtxo/nonWitnessUtxo, so the
+    // decoder can show input amounts and the real fee. A raw transaction
+    // scanned from a Coldcard Q has no UTXO data, so it falls back to that.
+    function renderFinalPreview() {
+      let hex = finalTxHex;
+      if (finalPsbt) { try { hex = finalPsbt.toHex(); } catch (e) { /* keep raw tx */ } }
+      renderTxPreview('finalTxPreview', hex);
+    }
+
+    function renderTxPreview(containerId, hex) {
+      const box = document.getElementById(containerId);
+      if (!box) return;
+      if (!hex) { box.style.display = 'none'; box.innerHTML = ''; return; }
+      box.innerHTML = `
+        <div class="tx-preview-toggle">
+          <h3>Transaction Preview</h3>
+          <span class="tx-preview-chevron">&#9660;</span>
+          <span class="tx-preview-summary"></span>
+          <a class="tx-preview-link" target="_blank" rel="noopener noreferrer">Full details in PSBT Decoder &#8599;</a>
+        </div>
+        <div class="tx-preview-body">
+          <iframe class="tx-preview-frame" title="Transaction preview (PSBT Decoder)"
+                  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" loading="lazy"></iframe>
+          <p class="tx-preview-note">Verdict and money flow rendered by <a href="${PSBT_DECODER_URL}" target="_blank" rel="noopener noreferrer">PSBT Decoder</a> in an isolated frame. Nothing leaves your browser. Verify every destination address and amount.</p>
+        </div>`;
+      const info = txPreviewInfo(hex);
+      box.querySelector('.tx-preview-summary').textContent = info.summary;
+      box.querySelector('.tx-preview-link').href = decoderUrl(hex, false);
+      box.querySelector('.tx-preview-frame').src = decoderUrl(hex, true);
+      const body = box.querySelector('.tx-preview-body');
+      const chevron = box.querySelector('.tx-preview-chevron');
+      if (info.nIn > PREVIEW_OPEN_MAX_INPUTS) {
+        body.style.display = 'none';
+        chevron.style.transform = 'rotate(-90deg)';
+      }
+      box.querySelector('.tx-preview-toggle').addEventListener('click', (e) => {
+        if (e.target.closest('a')) return;
+        const isOpen = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : '';
+        chevron.style.transform = isOpen ? 'rotate(-90deg)' : '';
+      });
+      box.style.display = 'block';
+    }
+
+    window.addEventListener('message', (e) => {
+      if (!e.data || e.data.type !== 'psbt-decoder:height') return;
+      const h = Number(e.data.height);
+      if (!Number.isFinite(h)) return;
+      document.querySelectorAll('.tx-preview-frame').forEach(f => {
+        if (f.contentWindow === e.source) f.style.height = Math.min(Math.max(h, 160), 1400) + 'px';
+      });
+    });
+
     function hidePsbtResult() {
+      renderTxPreview('psbtPreview', null);
       document.getElementById('psbtResult').style.display = 'none';
       document.getElementById('showQrPsbt').textContent = 'Show QR Code (Air-gap signing)';
       if (window._qrInterval) { clearInterval(window._qrInterval); window._qrInterval = null; }
@@ -2079,6 +2389,9 @@
             xfp: xfpInput ? xfpInput.value.trim() : '',
             derivationPath: pathInput ? pathInput.value.trim().replace(/[hH]/g, "'") : '',
             pubkey: pubkeyInput ? pubkeyInput.value.trim() : '',
+            // Needed so taproot inputs can resolve their internal key even when
+            // no explicit pubkey field was filled in (the WIF-sweep case).
+            wif: row.getAttribute('data-wif') || '',
           };
         });
         // Warn if any input has pubkey+path but no master fingerprint
@@ -2103,23 +2416,38 @@
         const fee = totalIn - totalOut;
         if (fee < 0) return alert('Outputs exceed inputs! Reduce output amounts.');
 
-        const psbt = createPsbtFromInputs(utxos, outputs, 0, '');
+        await refreshTipHeightIfStale();
+        const lt = validateLocktime();
+        if (lt.error) return alert(lt.error);
+        if (locktimeIsFuture(lt.value)) {
+          const when = lt.value < LOCKTIME_THRESHOLD
+            ? `block ${lt.value} (current height ${tipHeight})`
+            : new Date(lt.value * 1000).toLocaleString();
+          if (!confirm(`Lock time is in the future: the transaction cannot be broadcast until ${when}.\n\nContinue anyway?`)) return;
+        }
+
+        const psbt = createPsbtFromInputs(utxos, outputs, 0, '', lt.value);
         document.getElementById('feeCalc').textContent = `Transaction fee: ${fee} sats`;
 
         lastPsbt = psbt;
 
         // WIF inline signing mode
         if (allUtxosHaveWif()) {
-          // Sign each input with its WIF
-          let signed = 0;
+          // Sign each input with its WIF. Failures are collected rather than
+          // swallowed: a silent skip here used to surface only as an opaque
+          // "Can not finalize input" from finalizeAllInputs().
+          const signFailures = [];
           for (let i = 0; i < utxoRows.length; i++) {
             const wifVal = utxoRows[i].getAttribute('data-wif');
             if (!wifVal) continue;
             try {
-              const kp = ECPair.fromWIF(wifVal, net);
-              psbt.signInput(i, kp);
-              signed++;
-            } catch (e) { /* skip inputs that don't match this key */ }
+              signInputWithWif(psbt, i, wifVal, net);
+            } catch (e) {
+              signFailures.push(`input ${i} (${utxos[i].txid}:${utxos[i].vout}): ${e.message}`);
+            }
+          }
+          if (signFailures.length) {
+            throw new Error('Could not sign:\n' + signFailures.join('\n'));
           }
 
           psbt.finalizeAllInputs();
@@ -2129,6 +2457,7 @@
           document.getElementById('psbtResult').style.display = 'none';
           document.getElementById('wifSignResult').style.display = '';
           document.getElementById('wifSignedTxHex').textContent = finalTxHex;
+          renderFinalPreview();
 
           // Jump to broadcast
           setStep(2);
@@ -2146,6 +2475,7 @@
           console.log('[PSBT] Mixed mode: WIF inputs left unsigned for HW wallet signing');
         }
         document.getElementById('psbtHex').textContent = Buffer.from(psbt.toBuffer()).toString('hex');
+        renderTxPreview('psbtPreview', document.getElementById('psbtHex').textContent);
         document.getElementById('qrDisplay').style.display = 'none';
         if (window._qrInterval) { clearInterval(window._qrInterval); window._qrInterval = null; }
         document.getElementById('wifSignResult').style.display = 'none';
@@ -2241,27 +2571,74 @@
           combined.combine(psbtArray[i]);
         }
 
-        // Sign any WIF inputs that were left unsigned for HW wallet flow
+        // Sign any WIF inputs that were left unsigned for the HW wallet flow.
+        // Match rows to PSBT inputs by txid:vout, NOT by position: a hardware
+        // wallet may return inputs in a different order, and rows can be added
+        // or removed between Create and Combine. Signing by index then applies
+        // a key to the wrong input.
         const utxoRows = document.querySelectorAll('#utxoContainer [data-utxo]');
         const network = getSelectedNetwork();
+
+        const wifByOutpoint = new Map();
+        utxoRows.forEach(row => {
+          const wifVal = row.getAttribute('data-wif');
+          if (!wifVal) return;
+          const inputs = row.querySelectorAll('input');
+          const txid = inputs[0].value.trim().toLowerCase();
+          const vout = parseInt(inputs[1].value);
+          wifByOutpoint.set(`${txid}:${vout}`, wifVal);
+        });
+
         let wifSigned = 0;
-        for (let i = 0; i < utxoRows.length; i++) {
-          const wifVal = utxoRows[i].getAttribute('data-wif');
-          if (!wifVal) continue;
+        let wifAlreadySigned = 0;
+        const signFailures = [];
+        const matched = new Set();
+        combined.txInputs.forEach((txIn, i) => {
+          // txIn.hash is internal byte order; reverse it to get the txid
+          const txid = Buffer.from(txIn.hash).reverse().toString('hex');
+          const outpoint = `${txid}:${txIn.index}`;
+          const wifVal = wifByOutpoint.get(outpoint);
+          if (!wifVal) return;
+          matched.add(outpoint);
+          // The uploaded PSBT may already carry this input's signature -- the
+          // user signed it externally (tools/sign-psbt.py, another wallet) or
+          // is re-uploading a fully signed file. Signing again makes bip174
+          // throw "duplicate data", which would reject a finalizable PSBT.
+          if (isInputSigned(combined.data.inputs[i])) {
+            wifAlreadySigned++;
+            return;
+          }
           try {
-            const kp = ECPair.fromWIF(wifVal, network);
-            combined.signInput(i, kp);
+            signInputWithWif(combined, i, wifVal, network);
             wifSigned++;
-          } catch (e) { /* skip non-matching or already signed */ }
+          } catch (e) {
+            signFailures.push(`input ${i} (${txid}:${txIn.index}): ${e.message}`);
+          }
+        });
+        if (signFailures.length) {
+          throw new Error('Could not sign WIF input(s):\n' + signFailures.join('\n'));
         }
-        if (wifSigned > 0) {
-          console.log(`[Combine] Signed ${wifSigned} WIF input(s) before finalizing`);
+        // A WIF row whose outpoint is not in the uploaded PSBT (row edited
+        // after Create, or a PSBT for a different input set) would otherwise
+        // be skipped silently and fail later as an unexplained
+        // "Can not finalize input #N".
+        const unmatched = [...wifByOutpoint.keys()].filter(k => !matched.has(k));
+        if (unmatched.length) {
+          throw new Error(
+            `${unmatched.length} WIF input(s) on the Create step are not in the ` +
+            `uploaded PSBT, so they cannot be signed:\n  ${unmatched.join('\n  ')}\n` +
+            `Upload the PSBT that was created from these inputs, or remove them.`);
+        }
+        if (wifSigned > 0 || wifAlreadySigned > 0) {
+          console.log(`[Combine] Signed ${wifSigned} WIF input(s) before finalizing` +
+            (wifAlreadySigned ? `, ${wifAlreadySigned} already signed` : ''));
         }
 
         combined.finalizeAllInputs();
         finalPsbt = combined;
         finalTxHex = combined.extractTransaction().toHex();
         document.getElementById('combinedResult').innerText = finalTxHex;
+        renderFinalPreview();
         psbtAccumulator.length = 0;
         renderPsbtList();
         // Show broadcast section (already on the broadcast card)
@@ -2283,8 +2660,26 @@
           body: finalTxHex
         });
 
-        const txid = await response.text();
-        document.getElementById('broadcastResult').innerText = "Broadcasted TXID:\n" + txid;
+        const body = (await response.text()).trim();
+
+        // A rejected broadcast still returns a body -- mempool.space answers
+        // HTTP 400 with the node's error string ("min relay fee not met",
+        // "bad-txns-inputs-missingorspent", ...). Printing that as a TXID
+        // reports failure as success, so check the status AND the shape of
+        // the body: a real result is exactly 64 hex characters.
+        if (!response.ok) {
+          document.getElementById('broadcastResult').innerText =
+            `Broadcast REJECTED (HTTP ${response.status}):\n${body}`;
+          return alert(`Broadcast rejected by the node (HTTP ${response.status}):\n\n${body}`);
+        }
+
+        if (!/^[0-9a-fA-F]{64}$/.test(body)) {
+          document.getElementById('broadcastResult').innerText =
+            `Broadcast returned an unexpected response:\n${body}`;
+          return alert(`Broadcast did not return a TXID. The node said:\n\n${body}`);
+        }
+
+        document.getElementById('broadcastResult').innerText = "Broadcasted TXID:\n" + body;
       } catch (err) {
         alert("Broadcast failed: " + err.message);
       }
@@ -2376,8 +2771,185 @@
       updateOutputPercentages();
     });
 
-    // Fetch fee rates on load
+    // ---------------- Lock time (anti-fee-sniping) ----------------
+    // Like Bitcoin Core, Electrum and Sparrow, default nLockTime to the
+    // current block height so the transaction cannot be included in a block
+    // below the tip -- a miner reorging the last block to steal its fees
+    // cannot also pull this transaction into the replacement block. Sparrow
+    // exposes the same three choices: None / Block / Date.
+    // Below 500,000,000 nLockTime is a block height (valid from the NEXT
+    // block); at or above it is a UNIX timestamp, enforced against the
+    // median time of the last 11 blocks (BIP 113), so a date is typically
+    // effective about an hour after wall-clock.
+    const LOCKTIME_THRESHOLD = 500000000;
+    let tipHeight = null;          // last fetched chain tip, or null
+    let tipHeightFetchedAt = 0;    // Date.now() of that fetch
+    let tipFetchSeq = 0;           // guards against out-of-order responses
+    let locktimeAuto = true;       // block field still tracks the tip
+
+    const locktimeToggle = document.getElementById('locktimeToggle');
+    const locktimeBody = document.getElementById('locktimeBody');
+    const locktimeSummaryEl = document.getElementById('locktimeSummary');
+    const locktimeChevron = document.getElementById('locktimeChevron');
+    const locktimeBlockEl = document.getElementById('locktimeBlock');
+    const locktimeDateEl = document.getElementById('locktimeDate');
+    const locktimeHintEl = document.getElementById('locktimeHint');
+    locktimeToggle.addEventListener('click', () => {
+      const isOpen = locktimeBody.style.display !== 'none';
+      locktimeBody.style.display = isOpen ? 'none' : '';
+      locktimeSummaryEl.style.display = isOpen ? '' : 'none';
+      locktimeChevron.style.transform = isOpen ? 'rotate(-90deg)' : '';
+    });
+
+    function getLocktimeMode() {
+      const active = document.querySelector('.locktime-preset.active');
+      return active ? active.dataset.mode : 'none';
+    }
+
+    function toLocalDatetimeInput(d) {
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    // Resolves the UI choice to { value } or { error }. value is the
+    // nLockTime to put in the transaction (0 = none).
+    function validateLocktime() {
+      const mode = getLocktimeMode();
+      if (mode === 'none') return { value: 0 };
+      if (mode === 'block') {
+        const raw = locktimeBlockEl.value.trim();
+        if (raw === '') {
+          return tipHeight === null
+            ? { error: 'Lock time: block height unknown (could not fetch the chain tip). Enter one, or choose None.' }
+            : { value: tipHeight };
+        }
+        const h = Number(raw);
+        if (!Number.isInteger(h) || h < 0) return { error: 'Lock time: block height must be a non-negative integer.' };
+        if (h >= LOCKTIME_THRESHOLD) return { error: `Lock time: block height must be below ${LOCKTIME_THRESHOLD}.` };
+        return { value: h };
+      }
+      // date
+      const ms = Date.parse(locktimeDateEl.value);
+      if (Number.isNaN(ms)) return { error: 'Lock time: enter a valid date and time.' };
+      const ts = Math.floor(ms / 1000);
+      if (ts < LOCKTIME_THRESHOLD) return { error: 'Lock time: date must be after 5 Nov 1985.' };
+      if (ts > 0xffffffff) return { error: 'Lock time: date must be before 7 Feb 2106.' };
+      return { value: ts };
+    }
+
+    function getSelectedLocktime() {
+      const r = validateLocktime();
+      return r.error ? 0 : r.value;
+    }
+
+    // True when the chosen lock time is still in the future: the transaction
+    // would be rejected as non-final by every node until then.
+    function locktimeIsFuture(value) {
+      if (!value) return false;
+      if (value < LOCKTIME_THRESHOLD) return tipHeight !== null && value > tipHeight;
+      return value > Math.floor(Date.now() / 1000);
+    }
+
+    function updateLocktimeSummary() {
+      const mode = getLocktimeMode();
+      const r = validateLocktime();
+      const future = !r.error && locktimeIsFuture(r.value) ? ' \u26a0 future' : '';
+      if (mode === 'none') {
+        locktimeSummaryEl.textContent = 'None';
+        locktimeHintEl.textContent = 'No lock time: valid in any block. Forgoes anti-fee-sniping protection.';
+      } else if (mode === 'block') {
+        locktimeSummaryEl.textContent = r.error ? 'Block: --'
+          : `Block ${r.value}${r.value === tipHeight ? ' (current)' : ''}${future}`;
+        locktimeHintEl.textContent = (tipHeight === null ? 'Current height: unknown. ' : `Current height: ${tipHeight}. `) +
+          'Valid from the next block after this height. Default is the current height (anti-fee-sniping).' +
+          (future ? ' This height is in the future: the transaction cannot be broadcast until then.' : '');
+      } else {
+        locktimeSummaryEl.textContent = r.error ? 'Date: --'
+          : `Date ${new Date(r.value * 1000).toLocaleString()}${future}`;
+        locktimeHintEl.textContent = 'Valid once the median time of the last 11 blocks passes this moment ' +
+          '(typically ~1 hour after wall-clock). Not broadcastable until then.';
+      }
+    }
+
+    function setLocktimeMode(mode) {
+      document.querySelectorAll('.locktime-preset').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+      locktimeBlockEl.style.display = mode === 'block' ? '' : 'none';
+      locktimeDateEl.style.display = mode === 'date' ? '' : 'none';
+      document.getElementById('refreshLocktime').style.display = mode === 'block' ? '' : 'none';
+      if (mode === 'block' && locktimeAuto && tipHeight !== null) locktimeBlockEl.value = tipHeight;
+      if (mode === 'date' && !locktimeDateEl.value) locktimeDateEl.value = toLocalDatetimeInput(new Date());
+      updateLocktimeSummary();
+      hidePsbtResult();
+    }
+
+    // Fetches the chain tip height. mempool.space and server.py both answer
+    // /blocks/tip/height with a plain integer.
+    async function fetchTipHeight() {
+      // Only the most recent request may write the result. The page fires a
+      // fetch on load (dropdown still at its default) and again when network
+      // detection settles; a slow mainnet response arriving after the fast
+      // local regtest one used to stamp a mainnet height onto a regtest tx,
+      // which the node rejected as non-final.
+      const seq = ++tipFetchSeq;
+      let h = null;
+      try {
+        const base = getMempoolBaseUrl();
+        const resp = await fetch(`${base}/blocks/tip/height`, { signal: AbortSignal.timeout(5000) });
+        if (!resp.ok) throw new Error(`Tip API error: ${resp.status}`);
+        const parsed = parseInt((await resp.text()).trim(), 10);
+        if (!Number.isInteger(parsed) || parsed < 0) throw new Error('Bad tip height');
+        h = parsed;
+      } catch {
+        h = null;
+      }
+      if (seq !== tipFetchSeq) return tipHeight;  // superseded by a newer request
+      tipHeight = h;
+      tipHeightFetchedAt = h === null ? 0 : Date.now();
+      if (getLocktimeMode() === 'block' && locktimeAuto) {
+        locktimeBlockEl.value = tipHeight === null ? '' : tipHeight;
+      }
+      updateLocktimeSummary();
+      return tipHeight;
+    }
+
+    // Re-fetch before building when the auto height may be stale. Core reads
+    // the height at construction time; a page left open for hours would
+    // otherwise stamp a height far below the tip.
+    async function refreshTipHeightIfStale(maxAgeMs = 10 * 60 * 1000) {
+      if (getLocktimeMode() !== 'block' || !locktimeAuto) return;
+      if (tipHeight !== null && Date.now() - tipHeightFetchedAt < maxAgeMs) return;
+      await fetchTipHeight();
+    }
+
+    function resetLocktime() {
+      locktimeAuto = true;
+      locktimeDateEl.value = '';
+      setLocktimeMode('block');
+      fetchTipHeight();
+    }
+
+    document.querySelectorAll('.locktime-preset').forEach(btn => {
+      btn.addEventListener('click', () => setLocktimeMode(btn.dataset.mode));
+    });
+    document.getElementById('refreshLocktime').addEventListener('click', () => {
+      locktimeAuto = true;
+      fetchTipHeight();
+      hidePsbtResult();
+    });
+    locktimeBlockEl.addEventListener('input', () => {
+      locktimeAuto = false;
+      updateLocktimeSummary();
+      hidePsbtResult();
+    });
+    locktimeDateEl.addEventListener('input', () => {
+      updateLocktimeSummary();
+      hidePsbtResult();
+    });
+    setLocktimeMode('block');
+
+    // Fetch fee rates and chain tip on load
     fetchFeeRates();
+    fetchTipHeight();
 
     // Fetch UTXOs button
     document.getElementById('fetchUtxosBtn').addEventListener('click', fetchUtxos);
@@ -2431,6 +3003,7 @@
       rawTxCache.clear();
       refreshAllScriptLabels();
       fetchFeeRates().catch(() => {});
+      fetchTipHeight();
       updateBroadcastLabel();
       updateTipAddress();
       // Re-validate fetch address
@@ -2514,6 +3087,8 @@
       window._fn = {
         validateBitcoinAddress, validateScriptPubKey, decodeAddressFromScript,
         hexToBytes, estimateVirtualSize, createPsbtFromInputs, getSelectedNetwork,
+        toXOnly, isTaprootScript, taprootInternalKey, signInputWithWif, isInputSigned,
+        isP2shScript, inputPubkey, p2shP2wpkhRedeemScript, clearFetchInputIfStill,
         getMempoolBaseUrl, fetchRawTx, fetchAllNonWitnessUtxos, fetchUtxos,
         fetchFeeRates, rawTxCache,
         colourField, addInput, addFetchedInput, addOutput, updateFeeCalc,
@@ -2535,12 +3110,25 @@
         // Tip
         updateTipSummary, recalcTipIfPreset, updateTipAddress, getTipOutputCount,
         get TIP_ADDRESSES() { return TIP_ADDRESSES; },
+        // Transaction preview (PSBT Decoder)
+        renderTxPreview, renderFinalPreview, txPreviewInfo, decoderUrl,
+        get PSBT_DECODER_URL() { return PSBT_DECODER_URL; },
+        get PREVIEW_OPEN_MAX_INPUTS() { return PREVIEW_OPEN_MAX_INPUTS; },
+        set finalPsbt(v) { finalPsbt = v; },
+        set finalTxHex(v) { finalTxHex = v; },
+        // Lock time
+        validateLocktime, getSelectedLocktime, getLocktimeMode, setLocktimeMode,
+        fetchTipHeight, updateLocktimeSummary, locktimeIsFuture, resetLocktime,
+        get tipHeight() { return tipHeight; },
+        set tipHeight(v) { tipHeight = v; tipHeightFetchedAt = Date.now(); },
+        get locktimeAuto() { return locktimeAuto; },
         // Step wizard
         setStep, showCard, updateStepLayout, resetAll,
         get psbtAccumulator() { return psbtAccumulator; },
         get finalTxHex() { return finalTxHex; },
         get serverMode() { return serverMode; },
         set serverMode(v) { serverMode = v; },
+        get networkDetected() { return networkDetected; },
       };
       window._bitcoin = bitcoin;
       window._Buffer = Buffer;
@@ -2551,6 +3139,8 @@
       document.getElementById('feeRateChevron').style.transform = '';
       document.getElementById('tipBody').style.display = '';
       document.getElementById('tipChevron').style.transform = '';
+      document.getElementById('locktimeBody').style.display = '';
+      document.getElementById('locktimeChevron').style.transform = '';
     }
   </script>
 </body>

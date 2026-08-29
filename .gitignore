@@ -141,3 +141,7 @@ dist
 # Private companion — internal dev docs live in join-psbts-private (symlinked via its install.sh)
 CLAUDE.md
 .claude/
+
+# Test scratch
+tests/__pycache__/
+tests/_tmp_cc/

@@ -1,0 +1,3 @@
+[submodule "psbt-decoder"]
+	path = psbt-decoder
+	url = https://github.com/ObjSal/psbt-decoder.git

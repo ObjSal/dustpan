@@ -1836,6 +1836,521 @@ def run_tests(page, base_url):
     utxo_count = page.evaluate("() => document.querySelectorAll('#utxoContainer [data-utxo]').length")
     test("network switch: UTXOs cleared after confirm", utxo_count == 0)
 
+    # ========================================================
+    section("37. isInputSigned + no create-time taproot warning")
+    # ========================================================
+
+    page.select_option("#network", "regtest")
+    time.sleep(1)
+
+    # A P2WPKH input signed once must report as signed; signing it again is
+    # what bip174 rejects ("duplicate data"), so the combine step must skip it.
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const spk = window._bitcoin.payments.p2wpkh({
+            pubkey: window._Buffer.from(kp.publicKey), network: net }).output;
+        const utxos = [{ txid: 'ab'.repeat(32), vout: 0, value: 100000,
+                         scriptPubKey: window._Buffer.from(spk).toString('hex') }];
+        const dest = window._bitcoin.payments.p2wpkh({
+            pubkey: window._Buffer.from(window._ECPair.makeRandom({ network: net }).publicKey),
+            network: net }).address;
+        const psbt = window._fn.createPsbtFromInputs(utxos, [{ address: dest, value: 90000 }], 0, '');
+        const before = window._fn.isInputSigned(psbt.data.inputs[0]);
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        const after = window._fn.isInputSigned(psbt.data.inputs[0]);
+        let dup = '';
+        try { window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net); } catch (e) { dup = e.message; }
+        psbt.finalizeAllInputs();
+        const fin = window._fn.isInputSigned(psbt.data.inputs[0]);
+        return { before, after, dup, fin, nullish: window._fn.isInputSigned(undefined) };
+    }""")
+    test("isInputSigned: false before signing", r["before"] is False)
+    test("isInputSigned: true after partialSig", r["after"] is True)
+    test("isInputSigned: true after finalize", r["fin"] is True)
+    test("isInputSigned: false for missing input", r["nullish"] is False)
+    test("re-signing a signed input throws (why combine must skip it)",
+         "duplicate" in r["dup"].lower(), f"got '{r['dup']}'")
+
+    # Taproot signed via tapKeySig must also count as signed.
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const addr = window._fn.pubkeyToAddress(window._Buffer.from(kp.publicKey), 'p2tr', net);
+        const spk = window._Buffer.from(window._bitcoin.address.toOutputScript(addr, net)).toString('hex');
+        const utxos = [{ txid: 'cd'.repeat(32), vout: 1, value: 100000, scriptPubKey: spk, wif: kp.toWIF() }];
+        const psbt = window._fn.createPsbtFromInputs(utxos, [{ address: addr, value: 90000 }], 0, '');
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        return window._fn.isInputSigned(psbt.data.inputs[0]);
+    }""")
+    test("isInputSigned: true after taproot tapKeySig", r is True)
+
+    # Address-fetched P2TR (no pubkey, no WIF) is a normal HW-wallet input:
+    # an external signer supplies tapInternalKey. Create must not nag about it.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const addr = window._fn.pubkeyToAddress(window._Buffer.from(kp.publicKey), 'p2tr', net);
+        const spk = window._Buffer.from(window._bitcoin.address.toOutputScript(addr, net)).toString('hex');
+        window._fn.addFetchedInput('ef'.repeat(32), 0, 100000, spk, addr);
+        window._fn.addOutput(null, addr, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    time.sleep(1)
+    test("address-fetched P2TR: no taproot warning dialog at create",
+         not any('taproot' in d.lower() for d in _all_dialogs), f"got {_all_dialogs}")
+    try:
+        page.wait_for_function(
+            "() => (document.getElementById('psbtHex').textContent || '').length > 0",
+            timeout=5000)
+        built = True
+    except Exception:
+        built = False
+    test("address-fetched P2TR: PSBT still built", built, f"dialogs: {_all_dialogs}")
+
+    # ========================================================
+    section("38. taprootInternalKey validation + unmatched WIF rows at combine")
+    # ========================================================
+
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const wif = kp.toWIF();
+        const pub = window._Buffer.from(kp.publicKey).toString('hex');
+        const fromWif = window._Buffer.from(window._fn.toXOnly(window._Buffer.from(kp.publicKey))).toString('hex');
+        const hex = v => v ? window._Buffer.from(v).toString('hex') : null;
+        return {
+            fromWif,
+            badHexWithWif: hex(window._fn.taprootInternalKey({ pubkey: 'zz', wif }, net)),
+            shortHexWithWif: hex(window._fn.taprootInternalKey({ pubkey: pub.slice(0, 65), wif }, net)),
+            badHexNoWif: hex(window._fn.taprootInternalKey({ pubkey: 'zz' }, net)),
+            compressed: hex(window._fn.taprootInternalKey({ pubkey: pub }, net)),
+            xonly: hex(window._fn.taprootInternalKey({ pubkey: pub.slice(2) }, net)),
+            upperPadded: hex(window._fn.taprootInternalKey({ pubkey: ' ' + pub.toUpperCase() + ' ' }, net)),
+        };
+    }""")
+    test("taprootInternalKey: bad hex pubkey falls through to WIF", r["badHexWithWif"] == r["fromWif"])
+    test("taprootInternalKey: truncated pubkey falls through to WIF", r["shortHexWithWif"] == r["fromWif"])
+    test("taprootInternalKey: bad hex and no WIF -> null", r["badHexNoWif"] is None)
+    test("taprootInternalKey: compressed pubkey accepted", r["compressed"] == r["fromWif"])
+    test("taprootInternalKey: x-only pubkey accepted", r["xonly"] == r["fromWif"])
+    test("taprootInternalKey: whitespace/case tolerated", r["upperPadded"] == r["fromWif"])
+
+    # A WIF row whose outpoint is absent from the uploaded PSBT must be
+    # reported by name, not left unsigned to fail as "Can not finalize".
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; }")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: window._Buffer.from(kp.publicKey), network: net });
+        const spk = window._Buffer.from(p2w.output).toString('hex');
+        // Row on the Create step: outpoint 11..11:0 with a WIF
+        window._fn.addInput(null, '11'.repeat(32), 0, 100000, spk);
+        const row = document.querySelector('#utxoContainer [data-utxo]');
+        row.setAttribute('data-wif', kp.toWIF());
+        // Uploaded PSBT spends a DIFFERENT outpoint (22..22:0)
+        const psbt = window._fn.createPsbtFromInputs(
+            [{ txid: '22'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }],
+            [{ address: p2w.address, value: 90000 }], 0, '');
+        window._fn.addPsbtToList('other.psbt', 'file', new Uint8Array(psbt.toBuffer()));
+    }""")
+    page.evaluate("() => { window._fn.showCard('cardBroadcast'); document.getElementById('combineSection').style.display = ''; }")
+    _all_dialogs.clear()
+    page.click("#combinePsbt")
+    time.sleep(1)
+    msg = _all_dialogs[-1] if _all_dialogs else ""
+    test("combine: unmatched WIF row is reported by outpoint",
+         "not in the uploaded PSBT" in msg and ("11" * 32 + ":0") in msg, f"got {_all_dialogs}")
+    test("combine: unmatched WIF row does not surface as 'Can not finalize'",
+         "can not finalize" not in msg.lower(), f"got {msg}")
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; window._fn.renderPsbtList(); window._fn.showCard('cardCreate'); }")
+
+    # ========================================================
+    section("39. P2SH-P2WPKH WIF signing + taproot via nonWitnessUtxo")
+    # ========================================================
+
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const other = window._ECPair.makeRandom({ network: net });
+        const p2sh = window._bitcoin.payments.p2sh({
+            redeem: window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net }),
+            network: net });
+        const spk = B.from(p2sh.output).toString('hex');
+        const dest = window._bitcoin.payments.p2wpkh({ pubkey: B.from(other.publicKey), network: net }).address;
+        const out = { isP2sh: window._fn.isP2shScript(spk) };
+
+        // redeemScript helper: right key -> script, wrong key -> null
+        const rs = window._fn.p2shP2wpkhRedeemScript(B.from(kp.publicKey), spk, net);
+        out.redeemHex = rs ? B.from(rs).toString('hex') : null;
+        out.expectedRedeem = B.from(p2sh.redeem.output).toString('hex');
+        out.wrongKeyNull = window._fn.p2shP2wpkhRedeemScript(B.from(other.publicKey), spk, net) === null;
+
+        // (a) row with WIF: createPsbtFromInputs attaches redeemScript, signs, finalizes
+        const utxosWif = [{ txid: 'aa'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk, wif: kp.toWIF() }];
+        const p1 = window._fn.createPsbtFromInputs(utxosWif, [{ address: dest, value: 90000 }], 0, '');
+        out.hasRedeemAtCreate = !!p1.data.inputs[0].redeemScript;
+        window._fn.signInputWithWif(p1, 0, kp.toWIF(), net);
+        p1.finalizeAllInputs();
+        const tx1 = p1.extractTransaction();
+        out.aSigOk = tx1.ins[0].witness.length === 2 && tx1.ins[0].script.length > 0;
+
+        // (b) row without WIF/pubkey (uploaded PSBT case): signInputWithWif attaches it
+        const utxosBare = [{ txid: 'bb'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }];
+        const p2 = window._fn.createPsbtFromInputs(utxosBare, [{ address: dest, value: 90000 }], 0, '');
+        out.noRedeemAtCreate = !p2.data.inputs[0].redeemScript;
+        window._fn.signInputWithWif(p2, 0, kp.toWIF(), net);
+        out.redeemAddedAtSign = !!p2.data.inputs[0].redeemScript;
+        p2.finalizeAllInputs();
+        out.bFinalized = !!p2.data.inputs[0].finalScriptWitness;
+
+        // (c) wrong WIF on a P2SH input must throw, not attach a bogus redeemScript
+        const p3 = window._fn.createPsbtFromInputs(utxosBare, [{ address: dest, value: 90000 }], 0, '');
+        try { window._fn.signInputWithWif(p3, 0, other.toWIF(), net); out.wrongWifThrew = false; }
+        catch (e) { out.wrongWifThrew = true; }
+        out.wrongWifNoRedeem = !p3.data.inputs[0].redeemScript;
+        return out;
+    }""")
+    test("isP2shScript: detects a914..87", r["isP2sh"] is True)
+    test("p2shP2wpkhRedeemScript: matches bitcoinjs redeem output", r["redeemHex"] == r["expectedRedeem"])
+    test("p2shP2wpkhRedeemScript: wrong key -> null", r["wrongKeyNull"] is True)
+    test("P2SH-P2WPKH WIF row: redeemScript set at create", r["hasRedeemAtCreate"] is True)
+    test("P2SH-P2WPKH WIF row: signs and finalizes (scriptSig + 2-item witness)", r["aSigOk"] is True)
+    test("P2SH-P2WPKH bare row: no redeemScript at create", r["noRedeemAtCreate"] is True)
+    test("P2SH-P2WPKH bare row: signInputWithWif attaches redeemScript", r["redeemAddedAtSign"] is True)
+    test("P2SH-P2WPKH bare row: finalizes after sign", r["bFinalized"] is True)
+    test("P2SH-P2WPKH: wrong WIF throws", r["wrongWifThrew"] is True)
+    test("P2SH-P2WPKH: wrong WIF attaches no redeemScript", r["wrongWifNoRedeem"] is True)
+
+    # Taproot input carried with nonWitnessUtxo (no witnessUtxo): detection
+    # must still go by tapInternalKey and sign with the tweaked key.
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const B = window._Buffer;
+        const bitcoin = window._bitcoin;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const addr = window._fn.pubkeyToAddress(B.from(kp.publicKey), 'p2tr', net);
+        const spk = bitcoin.address.toOutputScript(addr, net);
+        // A real previous transaction paying the P2TR address
+        const prev = new bitcoin.Transaction();
+        prev.version = 2;
+        prev.addInput(B.alloc(32, 1), 0);
+        prev.addOutput(spk, 100000n);
+        const prevHex = prev.toHex();
+        const prevTxid = prev.getId();
+        const internal = window._fn.toXOnly(B.from(kp.publicKey));
+
+        const psbt = new bitcoin.Psbt({ network: net });
+        psbt.addInput({ hash: prevTxid, index: 0, nonWitnessUtxo: B.from(prevHex, 'hex'), tapInternalKey: internal });
+        psbt.addOutput({ address: addr, value: 90000n });
+        const out = { hasWitnessUtxo: !!psbt.data.inputs[0].witnessUtxo };
+        try {
+            window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+            out.signed = !!psbt.data.inputs[0].tapKeySig;
+            // bitcoinjs needs witnessUtxo to FINALIZE taproot; add it now so
+            // finalize proves the signature above was made with the tweaked key.
+            psbt.updateInput(0, { witnessUtxo: { script: spk, value: 100000n } });
+            psbt.finalizeAllInputs();
+            const tx = psbt.extractTransaction();
+            out.witnessLen = tx.ins[0].witness.length;
+            out.sigLen = tx.ins[0].witness[0].length;
+        } catch (e) { out.err = e.message; }
+        return out;
+    }""")
+    test("taproot nonWitnessUtxo-only: bitcoinjs did not add witnessUtxo", r.get("hasWitnessUtxo") is False)
+    test("taproot nonWitnessUtxo-only: signed with tweaked key (tapKeySig)", r.get("signed") is True, f"{r}")
+    test("taproot nonWitnessUtxo-only: finalizes to 1x64-byte witness",
+         r.get("witnessLen") == 1 and r.get("sigLen") == 64, f"{r}")
+
+    # The fetch input is cleared after a fetch only if it still holds the
+    # fetched value -- typing the next key during a slow fetch must survive.
+    r = page.evaluate("""() => {
+        const el = document.getElementById('fetchAddress');
+        el.value = 'fetched-value';
+        window._fn.clearFetchInputIfStill('fetched-value');
+        const cleared = el.value;
+        el.value = 'typed-meanwhile';
+        window._fn.clearFetchInputIfStill('fetched-value');
+        const kept = el.value;
+        el.value = '';
+        return { cleared, kept };
+    }""")
+    test("clearFetchInputIfStill: clears the fetched value", r["cleared"] == "")
+    test("clearFetchInputIfStill: keeps a newer value", r["kept"] == "typed-meanwhile")
+
+    # ========================================================
+    section("40. Lock time (anti-fee-sniping): None / Block / Date")
+    # ========================================================
+
+    page.select_option("#network", "regtest")
+    # Let the tip fetch triggered by the network change settle, so a late
+    # response cannot overwrite the tip heights injected below.
+    page.evaluate("() => window._fn.fetchTipHeight()")
+
+    # Default: Block mode, tracking the tip
+    test("locktime: default mode is block", page.evaluate("() => window._fn.getLocktimeMode()") == "block")
+    test("locktime: Block preset active by default",
+         page.evaluate("() => document.querySelector('.locktime-preset[data-mode=\"block\"]').classList.contains('active')"))
+    test("locktime: auto-tracking tip by default", page.evaluate("() => window._fn.locktimeAuto") is True)
+
+    # Inject a known tip and make sure block mode follows it
+    r = page.evaluate("""() => {
+        window._fn.tipHeight = 850000;
+        window._fn.setLocktimeMode('block');
+        return { field: document.getElementById('locktimeBlock').value,
+                 v: window._fn.validateLocktime(),
+                 summary: document.getElementById('locktimeSummary').textContent };
+    }""")
+    test("locktime block: field follows tip", r["field"] == "850000")
+    test("locktime block: value is tip", r["v"].get("value") == 850000, f"{r['v']}")
+    test("locktime block: summary marks current", "850000" in r["summary"] and "current" in r["summary"], r["summary"])
+
+    # Manual edit disables auto-tracking; validation bounds
+    r = page.evaluate("""() => {
+        const el = document.getElementById('locktimeBlock');
+        el.value = '840000'; el.dispatchEvent(new Event('input'));
+        const ok = window._fn.validateLocktime();
+        el.value = '500000000'; el.dispatchEvent(new Event('input'));
+        const tooBig = window._fn.validateLocktime();
+        el.value = '-1'; el.dispatchEvent(new Event('input'));
+        const neg = window._fn.validateLocktime();
+        el.value = '860000'; el.dispatchEvent(new Event('input'));
+        const future = { v: window._fn.validateLocktime(), isFuture: window._fn.locktimeIsFuture(860000),
+                         summary: document.getElementById('locktimeSummary').textContent };
+        return { auto: window._fn.locktimeAuto, ok, tooBig, neg, future };
+    }""")
+    test("locktime block: manual edit disables auto", r["auto"] is False)
+    test("locktime block: 840000 accepted", r["ok"].get("value") == 840000)
+    test("locktime block: >= 500,000,000 rejected", "error" in r["tooBig"])
+    test("locktime block: negative rejected", "error" in r["neg"])
+    test("locktime block: above tip flagged as future", r["future"]["isFuture"] is True and "future" in r["future"]["summary"])
+
+    # Date mode: datetime-local -> unix timestamp (local time)
+    r = page.evaluate("""() => {
+        window._fn.setLocktimeMode('date');
+        const el = document.getElementById('locktimeDate');
+        const prefilled = el.value !== '';
+        el.value = '2023-11-14T22:13'; el.dispatchEvent(new Event('input'));
+        const expected = Math.floor(new Date('2023-11-14T22:13').getTime() / 1000);
+        const v = window._fn.validateLocktime();
+        el.value = '1980-01-01T00:00'; el.dispatchEvent(new Event('input'));
+        const tooEarly = window._fn.validateLocktime();
+        el.value = ''; el.dispatchEvent(new Event('input'));
+        const empty = window._fn.validateLocktime();
+        return { prefilled, v, expected, tooEarly, empty };
+    }""")
+    test("locktime date: prefilled with now on first switch", r["prefilled"] is True)
+    test("locktime date: converts to unix timestamp", r["v"].get("value") == r["expected"], f"{r['v']} vs {r['expected']}")
+    test("locktime date: timestamp is >= 500,000,000", r["v"].get("value", 0) >= 500_000_000)
+    test("locktime date: pre-1985 rejected", "error" in r["tooEarly"])
+    test("locktime date: empty rejected", "error" in r["empty"])
+
+    # None mode
+    r = page.evaluate("""() => { window._fn.setLocktimeMode('none'); return window._fn.validateLocktime(); }""")
+    test("locktime none: value 0", r.get("value") == 0)
+
+    # createPsbtFromInputs honours the parameter (default 0)
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: window._Buffer.from(kp.publicKey), network: net });
+        const spk = window._Buffer.from(p2w.output).toString('hex');
+        const utxos = [{ txid: 'ab'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }];
+        const outputs = [{ address: p2w.address, value: 90000 }];
+        const a = window._fn.createPsbtFromInputs(utxos, outputs, 0, '');
+        const b = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', 850000);
+        const c = window._fn.createPsbtFromInputs(utxos, outputs, 0, '', 1700000000);
+        return { a: a.locktime, b: b.locktime, c: c.locktime, seq: b.txInputs[0].sequence };
+    }""")
+    test("createPsbtFromInputs: default locktime 0", r["a"] == 0)
+    test("createPsbtFromInputs: height locktime set", r["b"] == 850000)
+    test("createPsbtFromInputs: timestamp locktime set", r["c"] == 1700000000)
+    test("createPsbtFromInputs: sequence 0xfffffffd keeps locktime enforceable", r["seq"] == 0xfffffffd)
+
+    # Through the UI: Create with block mode at a known tip stamps the PSBT
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork();
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: window._Buffer.from(kp.publicKey), network: net });
+        const spk = window._Buffer.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('cd'.repeat(32), 0, 100000, spk, p2w.address);
+        // Keep the create handler off the network: it awaits
+        // fetchAllNonWitnessUtxos() before the lock time check, and this
+        // static-server regtest path would otherwise query mempool.space.
+        window._fn.rawTxCache.set('cd'.repeat(32), '00');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        window._fn.tipHeight = 850123;
+        document.querySelectorAll('.locktime-preset').forEach(b => b.classList.toggle('active', b.dataset.mode === 'block'));
+        document.getElementById('locktimeBlock').value = '850123';
+    }""")
+    page.fill("#feeRate", "1")
+    page.evaluate("() => { document.getElementById('psbtHex').textContent = ''; }")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => (document.getElementById('psbtHex').textContent || '').length > 0", timeout=5000)
+    except Exception:
+        pass
+    r = page.evaluate("""() => {
+        const hex = document.getElementById('psbtHex').textContent || '';
+        if (!hex) return { built: false };
+        const psbt = window._bitcoin.Psbt.fromHex(hex);
+        return { built: true, locktime: psbt.locktime };
+    }""")
+    test("UI create: PSBT built with block locktime", r.get("built") is True, f"dialogs: {_all_dialogs}")
+    test("UI create: PSBT locktime equals chosen height", r.get("locktime") == 850123, f"{r} dialogs: {_all_dialogs}")
+    test("UI create: no future-locktime confirm at current height",
+         not any('future' in d.lower() for d in _all_dialogs), f"{_all_dialogs}")
+
+    # Future height -> confirm() dialog (auto-accepted by the handler)
+    page.evaluate("""() => {
+        window._fn.tipHeight = 850123;
+        const el = document.getElementById('locktimeBlock');
+        el.value = '850999'; el.dispatchEvent(new Event('input'));
+    }""")
+    pre = page.evaluate("""() => ({ mode: window._fn.getLocktimeMode(), v: window._fn.validateLocktime(),
+        tip: window._fn.tipHeight, auto: window._fn.locktimeAuto, future: window._fn.locktimeIsFuture(850999),
+        btnVisible: !!document.getElementById('createPsbt').offsetParent,
+        card: document.getElementById('cardCreate').style.display })""")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    # The handler awaits fetchAllNonWitnessUtxos() (a network round trip on
+    # this static-server path) before it reaches the lock time check.
+    for _ in range(50):
+        if any('future' in d.lower() for d in _all_dialogs):
+            break
+        time.sleep(0.2)
+    test("UI create: future height shows confirm",
+         any('future' in d.lower() and '850999' in d for d in _all_dialogs), f"{_all_dialogs} pre={pre}")
+
+    # resetAll restores block/auto
+    page.evaluate("() => window._fn.resetAll()")
+    test("resetAll: locktime back to block mode", page.evaluate("() => window._fn.getLocktimeMode()") == "block")
+    test("resetAll: locktime auto-tracking restored", page.evaluate("() => window._fn.locktimeAuto") is True)
+
+    # ========================================================
+    section("41. Transaction Preview (PSBT Decoder submodule)")
+    # ========================================================
+
+    page.select_option("#network", "regtest")
+    test("preview: decoder URL is the bundled submodule",
+         page.evaluate("() => window._fn.PSBT_DECODER_URL") == "psbt-decoder/")
+
+    # Build an unsigned 1-in/1-out PSBT and a finalized copy, plus a raw tx.
+    fx = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        const utxos = [{ txid: 'ab'.repeat(32), vout: 0, value: 100000, scriptPubKey: spk }];
+        const outputs = [{ address: p2w.address, value: 90000 }];
+        const unsigned = window._fn.createPsbtFromInputs(utxos, outputs, 0, '').toHex();
+        const psbt = window._fn.createPsbtFromInputs(utxos, outputs, 0, '');
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        psbt.finalizeAllInputs();
+        const big = window._fn.createPsbtFromInputs(
+            Array.from({ length: 11 }, (_, i) => ({ txid: 'cd'.repeat(32), vout: i, value: 100000, scriptPubKey: spk })),
+            outputs, 0, '').toHex();
+        return { unsigned, finalized: psbt.toHex(), raw: psbt.extractTransaction().toHex(), big };
+    }""")
+    info = page.evaluate("(h) => window._fn.txPreviewInfo(h)", fx["unsigned"])
+    test("txPreviewInfo: unsigned PSBT counts", info["nIn"] == 1 and info["nOut"] == 1 and info["finalized"] is False)
+    test("txPreviewInfo: summary text", info["summary"] == "1 input \u2192 1 output", info["summary"])
+    info = page.evaluate("(h) => window._fn.txPreviewInfo(h)", fx["finalized"])
+    test("txPreviewInfo: finalized PSBT flagged", info["finalized"] is True and "finalized" in info["summary"])
+    info = page.evaluate("(h) => window._fn.txPreviewInfo(h)", fx["raw"])
+    test("txPreviewInfo: raw tx is finalized", info["finalized"] is True and info["nIn"] == 1)
+    test("txPreviewInfo: garbage -> empty summary", page.evaluate("() => window._fn.txPreviewInfo('zz').summary") == "")
+
+    # URLs: data in the #fragment only, network param, embed flag on the frame only
+    u = page.evaluate("(h) => ({ full: window._fn.decoderUrl(h, false), embed: window._fn.decoderUrl(h, true) })", fx["unsigned"])
+    test("decoderUrl: full link = submodule + network + #hex",
+         u["full"].startswith("psbt-decoder/?network=regtest#70736274ff") and "embed" not in u["full"], u["full"][:60])
+    test("decoderUrl: embed link carries embed=1", "embed=1" in u["embed"] and u["embed"].endswith(fx["unsigned"]))
+    test("decoderUrl: hex never in the query string", "?" not in u["full"].split("#")[1])
+
+    # Render on the Create card and let the real decoder load from the submodule
+    page.evaluate("(h) => { document.getElementById('psbtResult').style.display = ''; window._fn.renderTxPreview('psbtPreview', h); }", fx["unsigned"])
+    r = page.evaluate("""() => {
+        const box = document.getElementById('psbtPreview');
+        const f = box.querySelector('.tx-preview-frame'); const a = box.querySelector('.tx-preview-link');
+        return { shown: getComputedStyle(box).display, summary: box.querySelector('.tx-preview-summary').textContent,
+                 sandbox: f.getAttribute('sandbox'), src: f.src, href: a.getAttribute('href'), target: a.target, rel: a.rel,
+                 bodyOpen: box.querySelector('.tx-preview-body').style.display !== 'none' };
+    }""")
+    test("preview: container shown", r["shown"] == "block")
+    test("preview: summary shown", r["summary"] == "1 input \u2192 1 output", r["summary"])
+    test("preview: iframe sandboxed without allow-same-origin",
+         r["sandbox"] == "allow-scripts allow-popups allow-popups-to-escape-sandbox", r["sandbox"])
+    test("preview: iframe src is the embed URL", "psbt-decoder/?network=regtest&embed=1#70736274ff" in r["src"], r["src"][:80])
+    test("preview: full-details link opens a new tab safely",
+         r["href"].startswith("psbt-decoder/?network=regtest#") and r["target"] == "_blank" and "noopener" in r["rel"])
+    test("preview: open by default for a small sweep", r["bodyOpen"] is True)
+    try:
+        page.wait_for_function(
+            "() => (document.querySelector('#psbtPreview .tx-preview-frame').style.height || '').endsWith('px')", timeout=15000)
+        loaded = True
+    except Exception:
+        loaded = False
+    h = page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-frame').style.height")
+    test("preview: decoder embed loaded from submodule and reported its height", loaded, f"height={h!r}")
+    test("preview: reported height clamped to [160, 1400]px",
+         loaded and 160 <= int(h[:-2]) <= 1400, h)
+
+    # Collapse / expand via the heading; the link inside the heading does not toggle
+    page.click("#psbtPreview .tx-preview-toggle h3")
+    test("preview: heading click collapses",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-body').style.display") == "none")
+    page.click("#psbtPreview .tx-preview-toggle h3")
+    test("preview: heading click expands again",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-body').style.display") == "")
+
+    # Large sweeps start collapsed
+    page.evaluate("(h) => window._fn.renderTxPreview('psbtPreview', h)", fx["big"])
+    test("preview: >10 inputs starts collapsed",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-body').style.display") == "none")
+    test("preview: collapsed summary still shows counts",
+         page.evaluate("() => document.querySelector('#psbtPreview .tx-preview-summary').textContent") == "11 inputs \u2192 1 output")
+
+    # Broadcast preview prefers the finalized PSBT over the raw tx
+    page.evaluate("([raw, fin]) => { window._fn.finalTxHex = raw; window._fn.finalPsbt = null; window._fn.renderFinalPreview(); }", [fx["raw"], fx["finalized"]])
+    href_raw = page.evaluate("() => document.querySelector('#finalTxPreview .tx-preview-link').getAttribute('href')")
+    test("final preview: raw tx used when no PSBT (Coldcard Q scan)", "#0200" in href_raw or "#0100" in href_raw, href_raw[:50])
+    page.evaluate("([raw, fin]) => { window._fn.finalTxHex = raw; window._fn.finalPsbt = window._bitcoin.Psbt.fromHex(fin); window._fn.renderFinalPreview(); }", [fx["raw"], fx["finalized"]])
+    r = page.evaluate("() => ({ href: document.querySelector('#finalTxPreview .tx-preview-link').getAttribute('href'), summary: document.querySelector('#finalTxPreview .tx-preview-summary').textContent })")
+    test("final preview: finalized PSBT preferred (carries amounts)", "#70736274ff" in r["href"], r["href"][:50])
+    test("final preview: summary says finalized", "finalized" in r["summary"], r["summary"])
+
+    # Per-file inspect link in the signed PSBT list
+    page.evaluate("(h) => { window._fn.psbtAccumulator.length = 0; window._fn.addPsbtToList('cc-signed.psbt', 'file', new Uint8Array(window._Buffer.from(h, 'hex'))); }", fx["unsigned"])
+    r = page.evaluate("() => { const a = document.querySelector('#psbtList .psbt-inspect'); return a ? { href: a.getAttribute('href'), target: a.target, rel: a.rel } : null; }")
+    test("psbt list: inspect link present", r is not None)
+    test("psbt list: inspect link opens the decoder with that file's hex",
+         r is not None and r["href"] == "psbt-decoder/?network=regtest#" + fx["unsigned"] and r["target"] == "_blank" and "noopener" in r["rel"])
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; window._fn.renderPsbtList(); }")
+
+    # Cleared with the results they belong to
+    page.evaluate("() => window._fn.hidePsbtResult()")
+    test("hidePsbtResult clears the create preview",
+         page.evaluate("() => { const b = document.getElementById('psbtPreview'); return getComputedStyle(b).display === 'none' && b.innerHTML === ''; }"))
+    page.evaluate("() => window._fn.resetAll()")
+    test("resetAll clears the broadcast preview",
+         page.evaluate("() => { const b = document.getElementById('finalTxPreview'); return getComputedStyle(b).display === 'none' && b.innerHTML === ''; }"))
+
 
 # ============================================================
 # Main
