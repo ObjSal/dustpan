@@ -601,12 +601,18 @@
         if (/^[0-9a-fA-F]+$/.test(data) && data.length >= 10 && data.length % 2 === 0) {
           const versionHex = data.substring(0, 8).toLowerCase();
           if (versionHex === '01000000' || versionHex === '02000000') {
+            const scanErr = checkFinalTxWitness(data.toLowerCase());
+            if (scanErr) {
+              stopQrScanner();
+              document.getElementById('qrScanProgress').textContent = 'Scanned transaction rejected.';
+              alert('Scanned transaction rejected:\n\n' + scanErr);
+              return;
+            }
             document.getElementById('qrScanProgress').textContent = 'Signed transaction scanned!';
             stopQrScanner();
             finalTxHex = data.toLowerCase();
             finalPsbt = null;
             renderFinalPreview();
-            finalPsbt = null;
             document.getElementById('combinedResult').innerText = finalTxHex;
             // Show broadcast section (already on the broadcast card)
             document.getElementById('broadcastSection').style.display = '';
@@ -1993,6 +1999,94 @@
       return (scriptPubKeyHex || '').toLowerCase().startsWith('5120');
     }
 
+    // Native witness programs: P2WPKH (0014+20B), P2WSH (0020+32B), P2TR (5120+32B).
+    // Consensus requires an EMPTY scriptSig when spending any of these.
+    // True for paths like m/84'/0'/0' (every segment hardened, <=3 deep): an
+    // account, not a key. Key paths end in unhardened chain/index segments.
+    function looksLikeAccountPath(path) {
+      const segs = (path || '').trim().replace(/^m\/?/i, '').split('/').filter(Boolean);
+      if (!segs.length) return false;
+      return segs.length <= 3 && segs.every(sg => /['hH]$/.test(sg));
+    }
+
+    function isWitnessProgramScript(scriptPubKeyHex) {
+      const spk = (scriptPubKeyHex || '').toLowerCase();
+      return (spk.startsWith('0014') && spk.length === 44) ||
+             (spk.startsWith('0020') && spk.length === 68) ||
+             (spk.startsWith('5120') && spk.length === 68);
+    }
+
+    // Map of "txid:vout" -> scriptPubKey hex for every UTXO row on the page.
+    function rowScriptsByOutpoint() {
+      const map = new Map();
+      document.querySelectorAll('#utxoContainer [data-utxo]').forEach(row => {
+        const inputs = row.querySelectorAll('input');
+        const txid = inputs[0].value.trim().toLowerCase();
+        const vout = parseInt(inputs[1].value);
+        const spk = (inputs[3] ? inputs[3].value : '').trim().toLowerCase();
+        if (txid && Number.isInteger(vout) && spk) map.set(`${txid}:${vout}`, spk);
+      });
+      return map;
+    }
+
+    const LEGACY_SCRIPTSIG_HINT =
+      'This is the known Coldcard Q auto-finalize bug: when every input is signed it ' +
+      'builds the spend as legacy P2PKH, and the network rejects it ("Witness requires ' +
+      'empty scriptSig"). Upload the device\'s -signed.psbt (or the PSBT from USB), not ' +
+      'its -final.txn / QR transaction, and let this page finalize. When signing serially, ' +
+      'sign with the Coldcard Q FIRST so it never sees a fully-signed PSBT.';
+
+    // Rejects a PSBT whose already-finalized inputs spend a witness program with
+    // a non-empty scriptSig (the P2PKH-style construction), BEFORE we finalize
+    // and extract, so the bad input is named rather than surfacing as an
+    // opaque "Can not finalize input #N" or a rejected broadcast.
+    function checkPsbtFinalizedInputs(psbt) {
+      const bad = [];
+      psbt.data.inputs.forEach((inp, i) => {
+        let spk = '';
+        if (inp.witnessUtxo) spk = Buffer.from(inp.witnessUtxo.script).toString('hex');
+        else if (inp.nonWitnessUtxo) {
+          try {
+            const prev = bitcoin.Transaction.fromBuffer(Buffer.from(inp.nonWitnessUtxo));
+            spk = Buffer.from(prev.outs[psbt.txInputs[i].index].script).toString('hex');
+          } catch (e) { /* unknown */ }
+        }
+        if (!isWitnessProgramScript(spk)) return;
+        if (inp.finalScriptSig && inp.finalScriptSig.length > 0) {
+          const txid = Buffer.from(psbt.txInputs[i].hash).reverse().toString('hex');
+          bad.push(`input ${i} (${txid}:${psbt.txInputs[i].index})`);
+        }
+      });
+      if (!bad.length) return null;
+      return `${bad.join(', ')} spend${bad.length === 1 ? 's' : ''} a native segwit output but ` +
+        `${bad.length === 1 ? 'was' : 'were'} finalized with a legacy (P2PKH-style) scriptSig ` +
+        `instead of a witness.\n\n${LEGACY_SCRIPTSIG_HINT}`;
+    }
+
+    // Same check on a raw transaction, using the page's UTXO rows to learn
+    // each input's prevout type (a raw tx carries none of that itself).
+    // Inputs that match no row are skipped. Returns an error string or null.
+    function checkFinalTxWitness(txHex) {
+      let tx;
+      // Unparsable input is not this guard's concern (the node rejects it with
+      // its own message); only a parsed tx can exhibit the legacy-scriptSig defect.
+      try { tx = bitcoin.Transaction.fromHex(txHex); } catch (e) { return null; }
+      const rows = rowScriptsByOutpoint();
+      const bad = [];
+      tx.ins.forEach((txIn, i) => {
+        const txid = Buffer.from(txIn.hash).reverse().toString('hex');
+        const spk = rows.get(`${txid}:${txIn.index}`);
+        if (!spk || !isWitnessProgramScript(spk)) return;
+        if (txIn.script.length > 0 || !txIn.witness || txIn.witness.length === 0) {
+          bad.push(`input ${i} (${txid}:${txIn.index})`);
+        }
+      });
+      if (!bad.length) return null;
+      return `${bad.join(', ')} spend${bad.length === 1 ? 's' : ''} a native segwit output but ` +
+        `${bad.length === 1 ? 'carries' : 'carry'} a scriptSig instead of a witness. The network ` +
+        `will reject this transaction.\n\n${LEGACY_SCRIPTSIG_HINT}`;
+    }
+
     function isP2shScript(scriptPubKeyHex) {
       const spk = (scriptPubKeyHex || '').toLowerCase();
       return spk.startsWith('a914') && spk.length === 46 && spk.endsWith('87');
@@ -2400,6 +2494,33 @@
           const ok = confirm(`${missingXfp.length} input(s) have HW wallet info but no master fingerprint. Your hardware wallet may not recognize these inputs.\n\nContinue anyway?`);
           if (!ok) return;
         }
+        // bip32Derivation needs xfp + path + pubkey. A row with the first two
+        // but no pubkey (and no xpub to derive it from) silently gets NO
+        // key-origin info, so the device has nothing to recognise the input by.
+        const missingPubkey = utxos.filter(u => u.xfp && u.derivationPath && !u.pubkey && !u.wif);
+        if (missingPubkey.length > 0) {
+          const list = missingPubkey.map(u => `  ${u.txid}:${u.vout}`).join('\n');
+          const ok = confirm(
+            `${missingPubkey.length} input(s) have a master fingerprint and derivation path but no ` +
+            `public key, so NO key-origin info will be written and your hardware wallet will not ` +
+            `recognise them:\n\n${list}\n\n` +
+            `Enter the xpub (the public key is derived from it) or the 66-hex public key ` +
+            `for the FULL path of that address (e.g. m/84'/0'/0'/0/5).\n\nContinue anyway?`);
+          if (!ok) return;
+        }
+        // An account-level path (m/84'/0'/0') is not the key's path; the device
+        // derives a different key there and cannot sign.
+        const accountPath = utxos.filter(u => u.pubkey && u.derivationPath && looksLikeAccountPath(u.derivationPath));
+        if (accountPath.length > 0) {
+          const list = accountPath.map(u => `  ${u.txid}:${u.vout}  ${u.derivationPath}`).join('\n');
+          const ok = confirm(
+            `${accountPath.length} input(s) use an account-level derivation path:\n\n${list}\n\n` +
+            `The key for an address lives below the account, usually at .../0/N (receive) or ` +
+            `.../1/N (change). Sparrow's "Copy output descriptor" shows the full path in brackets, ` +
+            `e.g. [xfp/84h/0h/0h/0/5]. With the account path the device derives a different key ` +
+            `and cannot sign.\n\nContinue anyway?`);
+          if (!ok) return;
+        }
 
         const feeRateVal = parseFloat(document.getElementById('feeRate').value);
         if (!feeRateVal || feeRateVal <= 0) return alert('Enter a fee rate.');
@@ -2634,9 +2755,14 @@
             (wifAlreadySigned ? `, ${wifAlreadySigned} already signed` : ''));
         }
 
+        const preErr = checkPsbtFinalizedInputs(combined);
+        if (preErr) throw new Error(preErr);
         combined.finalizeAllInputs();
+        const extractedHex = combined.extractTransaction().toHex();
+        const postErr = checkFinalTxWitness(extractedHex);
+        if (postErr) throw new Error(postErr);
         finalPsbt = combined;
-        finalTxHex = combined.extractTransaction().toHex();
+        finalTxHex = extractedHex;
         document.getElementById('combinedResult').innerText = finalTxHex;
         renderFinalPreview();
         psbtAccumulator.length = 0;
@@ -2650,6 +2776,8 @@
 
     document.getElementById('broadcastTx').onclick = async () => {
       if (!finalTxHex) return alert("No finalized transaction available");
+      const witErr = checkFinalTxWitness(finalTxHex);
+      if (witErr) return alert('Not broadcasting:\n\n' + witErr);
 
       const broadcastUrl = getMempoolBaseUrl() + '/tx';
 
@@ -3110,6 +3238,9 @@
         // Tip
         updateTipSummary, recalcTipIfPreset, updateTipAddress, getTipOutputCount,
         get TIP_ADDRESSES() { return TIP_ADDRESSES; },
+        // Witness / key-origin guards
+        isWitnessProgramScript, checkPsbtFinalizedInputs, checkFinalTxWitness,
+        rowScriptsByOutpoint, looksLikeAccountPath,
         // Transaction preview (PSBT Decoder)
         renderTxPreview, renderFinalPreview, txPreviewInfo, decoderUrl,
         get PSBT_DECODER_URL() { return PSBT_DECODER_URL; },
