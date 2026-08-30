@@ -2504,8 +2504,10 @@
             `${missingPubkey.length} input(s) have a master fingerprint and derivation path but no ` +
             `public key, so NO key-origin info will be written and your hardware wallet will not ` +
             `recognise them:\n\n${list}\n\n` +
-            `Enter the xpub (the public key is derived from it) or the 66-hex public key ` +
-            `for the FULL path of that address (e.g. m/84'/0'/0'/0/5).\n\nContinue anyway?`);
+            `Easiest fix: paste the wallet's account zpub/xpub into the fetch box instead of ` +
+            `individual addresses -- every UTXO then carries its path and public key, and you ` +
+            `type the fingerprint once. Otherwise enter the xpub in the row (the key is derived) ` +
+            `or the 66-hex public key for the FULL path (e.g. m/84'/0'/0'/0/5).\n\nContinue anyway?`);
           if (!ok) return;
         }
         // An account-level path (m/84'/0'/0') is not the key's path; the device
