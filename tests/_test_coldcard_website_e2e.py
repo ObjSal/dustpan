@@ -26,6 +26,7 @@ import os
 import re
 import socket
 import subprocess
+import coldcard_sim
 import sys
 import threading
 import time
@@ -51,6 +52,7 @@ def start_http_server(port):
 
 # Derivation path for the Coldcard input (BIP84, first receive address)
 CC_PATH = "m/84'/1'/0'/0/0"
+CC_ACCOUNT_PATH = "m/84h/1h/0h"   # ckcc xpub wants h-notation
 
 MEMPOOL_API = "https://mempool.space/testnet4/api"
 
@@ -65,16 +67,18 @@ def pubkey_to_p2wpkh(pubkey_hex, network):
 
 def detect_coldcard():
     """Auto-detect Coldcard device info via ckcc CLI.
-    Returns (xfp, addr, pubkey) or raises RuntimeError.
-    Uses ckcc xfp + ckcc pubkey only (no ckcc addr, which blocks
-    the device waiting for user to dismiss the on-screen display)."""
-    result = subprocess.run(["ckcc", "xfp"], capture_output=True, text=True, timeout=30)
+    Returns (xfp, addr, pubkey, account_xpub) or raises RuntimeError.
+    Uses ckcc xfp + ckcc pubkey + ckcc xpub only (no ckcc addr, which
+    blocks the device waiting for user to dismiss the on-screen display).
+    The account xpub is what the website is fed: a plain address cannot be
+    given a key origin by hand any more, the xpub fetch supplies it."""
+    result = subprocess.run(coldcard_sim.ckcc("xfp"), capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc xfp failed: {result.stderr.strip()}")
     xfp = result.stdout.strip()
     time.sleep(1)  # let Coldcard USB settle between commands
 
-    result = subprocess.run(["ckcc", "pubkey", CC_PATH],
+    result = subprocess.run(coldcard_sim.ckcc("pubkey", CC_PATH),
                             capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc pubkey failed: {result.stderr.strip()}")
@@ -83,8 +87,15 @@ def detect_coldcard():
     # Derive address locally from pubkey (avoids ckcc addr which
     # shows address on Coldcard screen and blocks USB until dismissed)
     addr = pubkey_to_p2wpkh(pubkey, "test")
+    time.sleep(1)
 
-    return xfp, addr, pubkey
+    result = subprocess.run(coldcard_sim.ckcc("xpub", CC_ACCOUNT_PATH),
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"ckcc xpub failed: {result.stderr.strip()}")
+    account_xpub = result.stdout.strip()
+
+    return xfp, addr, pubkey, account_xpub
 
 # ============================================================
 # Test infra
@@ -140,7 +151,8 @@ def run_tests():
         return
 
     time.sleep(0.5)  # let USB settle
-    result = subprocess.run(["ckcc", "chain"], capture_output=True, text=True, timeout=30)
+    coldcard_sim.start_simulator(chain="XTN")
+    result = subprocess.run(coldcard_sim.ckcc("chain"), capture_output=True, text=True, timeout=30)
     test("Coldcard chain is XTN", result.stdout.strip() == "XTN")
     if result.stdout.strip() != "XTN":
         return
@@ -148,7 +160,7 @@ def run_tests():
     # Auto-detect Coldcard device info
     print("  Auto-detecting Coldcard device info...")
     try:
-        CC_XFP, CC_ADDR, CC_PUBKEY = detect_coldcard()
+        CC_XFP, CC_ADDR, CC_PUBKEY, CC_XPUB = detect_coldcard()
     except RuntimeError as e:
         test("ckcc can reach Coldcard", False, str(e))
         return
@@ -158,6 +170,8 @@ def run_tests():
     print(f"  Pubkey: {CC_PUBKEY}")
 
     # Check both addresses have UTXOs
+    if coldcard_sim.using_simulator():
+        coldcard_sim.ensure_testnet4_funds(CC_ADDR, wif_key, wif_address, MEMPOOL_API)
     cc_utxos = fetch_json(f"{MEMPOOL_API}/address/{CC_ADDR}/utxo")
     wif_utxos = fetch_json(f"{MEMPOOL_API}/address/{wif_address}/utxo")
     test("CC has UTXOs on testnet4", len(cc_utxos) >= 1)
@@ -199,7 +213,8 @@ def run_tests():
         page.wait_for_function("() => window._fn !== undefined", timeout=15000)
 
         # Auto-accept dialogs (e.g. missing XFP warning)
-        page.on("dialog", lambda d: d.accept())
+        _dialogs = []
+        page.on("dialog", lambda d: (_dialogs.append(d.message), d.accept()))
 
         # Select testnet4 (static server auto-selects testnet4, but be explicit)
         page.select_option("#network", "testnet")
@@ -216,9 +231,12 @@ def run_tests():
         wif_utxo_count = page.locator("#utxoContainer [data-utxo]").count()
         test("WIF UTXOs fetched", wif_utxo_count >= 1, f"found {wif_utxo_count}")
 
-        # Fetch CC address UTXOs
-        print("  Fetching CC UTXOs...")
-        page.fill("#fetchAddress", CC_ADDR)
+        # Fetch CC UTXOs by the ACCOUNT XPUB. The website no longer lets a
+        # plain address row be given HW info by hand (it cannot be done
+        # correctly without the per-address pubkey); the xpub scan fills the
+        # path and pubkey for every UTXO and the fingerprint is typed once.
+        print("  Fetching CC UTXOs by account xpub...")
+        page.fill("#fetchAddress", CC_XPUB)
         page.click("#fetchUtxosBtn")
         # Wait for more UTXOs to appear
         page.wait_for_timeout(5000)
@@ -229,45 +247,23 @@ def run_tests():
              f"total={total_utxo_count}, wif={wif_utxo_count}, cc={cc_utxo_count}")
 
         # ========================================================
-        section("3. Set HW Wallet Info for CC UTXOs")
+        section("3. Master fingerprint for the CC xpub source")
         # ========================================================
 
-        # CC UTXOs need HW wallet info (xfp, pubkey, path)
-        # They are plain address fetches, so HW fields are empty
-        # Find CC UTXO rows (ones without data-wif)
-        all_utxo_rows = page.locator("#utxoContainer [data-utxo]").all()
-        cc_rows = []
-        for row in all_utxo_rows:
-            has_wif = row.get_attribute("data-wif")
-            if not has_wif:
-                cc_rows.append(row)
+        # The xpub scan pre-filled path + pubkey on every CC row; the
+        # fingerprint cannot be derived from an xpub, so it is typed once in
+        # the source label and propagates to each row's .hw-xfp.
+        xfp_label = page.locator("#utxoContainer .utxo-source-label[data-xpub-source] .xpub-xfp")
+        test("CC xpub source label has a fingerprint field", xfp_label.count() >= 1)
+        xfp_label.first.fill(CC_XFP)
+        xfp_label.first.dispatch_event("input")
+        page.wait_for_timeout(300)
 
-        test("found CC rows without WIF", len(cc_rows) >= 1, f"found {len(cc_rows)}")
-
-        for row in cc_rows:
-            # Expand HW wallet section
-            hw_toggle = row.locator(".hw-toggle")
-            if hw_toggle.count() > 0:
-                hw_toggle.click()
-                page.wait_for_timeout(200)
-
-            # Fill in HW wallet fields
-            xfp_input = row.locator(".hw-xfp")
-            path_input = row.locator(".hw-path")
-            pubkey_input = row.locator(".hw-pubkey")
-
-            if xfp_input.count() > 0:
-                xfp_input.fill(CC_XFP)
-            if path_input.count() > 0:
-                path_input.fill(CC_PATH)
-            if pubkey_input.count() > 0 and not pubkey_input.get_attribute("readonly"):
-                pubkey_input.fill(CC_PUBKEY)
-
-        # Verify HW info was set
         hw_set = page.evaluate("""() => {
             const rows = document.querySelectorAll('#utxoContainer [data-utxo]');
             let hwCount = 0;
             for (const row of rows) {
+                if (row.getAttribute('data-wif')) continue;
                 const xfp = row.querySelector('.hw-xfp');
                 const path = row.querySelector('.hw-path');
                 const pubkey = row.querySelector('.hw-pubkey');
@@ -275,7 +271,15 @@ def run_tests():
             }
             return hwCount;
         }""")
-        test("HW wallet info set on CC UTXOs", hw_set >= 1, f"hw_set={hw_set}")
+        test("CC rows carry complete key origin (xfp + path + pubkey)", hw_set >= 1, f"hw_set={hw_set}")
+        cc_pub_match = page.evaluate("""(pub) => {
+            return Array.from(document.querySelectorAll('#utxoContainer [data-utxo]'))
+                .some(r => !r.getAttribute('data-wif') && r.querySelector('.hw-pubkey') && r.querySelector('.hw-pubkey').value === pub);
+        }""", CC_PUBKEY)
+        test("xpub-derived pubkey matches ckcc pubkey for the funded path", cc_pub_match)
+        # This suite drives the real UI: leave the software-signer claim OFF
+        # so Create is only allowed because every input has a WIF or key origin.
+        page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = false; }")
 
         # ========================================================
         section("4. Configure Output & Create PSBT")
@@ -310,9 +314,10 @@ def run_tests():
         }""")
         page.wait_for_timeout(300)
 
-        # Verify button says "Create & Partially Sign PSBT"
+        # Mixed WIF + HW mode: WIF signing is deferred to the combine step,
+        # so the button reads plain "Create PSBT".
         btn_text = page.locator("#createPsbt").inner_text()
-        test("button says partial sign", "Partially Sign" in btn_text, f"got: '{btn_text}'")
+        test("button says Create PSBT (mixed mode)", btn_text.strip() == "Create PSBT", f"got: '{btn_text}'")
 
         # Click Create (may fetch nonWitnessUtxo from mempool.space)
         print("  Creating PSBT...")
@@ -324,7 +329,9 @@ def run_tests():
         test("PSBT result visible", psbt_visible)
         if not psbt_visible:
             # Check for alert
-            print("  ❌ PSBT not created — check for errors")
+            print("  ❌ PSBT not created — dialogs seen:")
+            for d in _dialogs:
+                print(f"     - {d[:200]}")
             browser.close()
             return
 
@@ -350,10 +357,14 @@ def run_tests():
             }
             return { total: psbt.data.inputs.length, partial: partialCount };
         }""")
-        test("PSBT has partial sigs (WIF signed)", has_partial["partial"] >= 1,
+        # Deferred WIF signing: in mixed mode the created PSBT carries NO
+        # signatures at all -- WIF inputs are signed in the browser at the
+        # combine step, after the Coldcard returns its signature. (Pre-signed
+        # WIF inputs used to trigger the Coldcard Q auto-finalize bug.)
+        test("created PSBT is fully unsigned (WIF signing deferred)", has_partial["partial"] == 0,
              f"{has_partial['partial']}/{has_partial['total']} inputs have partial_sigs")
-        test("PSBT has unsigned inputs (for CC)", has_partial["partial"] < has_partial["total"],
-             f"all {has_partial['total']} are signed — nothing for CC to sign")
+        test("PSBT has inputs for the CC to sign", has_partial["total"] >= 2,
+             f"only {has_partial['total']} inputs")
 
         # ========================================================
         section("5. Sign with Coldcard")
@@ -363,12 +374,13 @@ def run_tests():
             os.remove(psbt_out_path)
 
         print("  Sending PSBT to Coldcard for signing...")
-        print("  >>> APPROVE THE TRANSACTION ON YOUR COLDCARD <<<")
+        if coldcard_sim.using_simulator():
+            print("  (simulator: approving automatically)")
+        else:
+            print("  >>> APPROVE THE TRANSACTION ON YOUR COLDCARD <<<")
         print()
 
-        sign_result = subprocess.run(
-            ["ckcc", "sign", psbt_in_path, psbt_out_path],
-            capture_output=True, text=True, timeout=300)
+        sign_result = coldcard_sim.sign_psbt(psbt_in_path, psbt_out_path)
 
         test("ckcc sign succeeded", sign_result.returncode == 0,
              f"stderr: {sign_result.stderr.strip()}")

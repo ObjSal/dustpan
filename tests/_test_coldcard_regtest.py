@@ -5,6 +5,10 @@ Test real Coldcard MK4 signing via ckcc CLI.
 Requires:
   - Coldcard MK4 plugged in and unlocked
   - ckcc CLI: pip install ckcc-protocol
+  - Coldcard simulator (github.com/Coldcard/firmware; COLDCARD_FIRMWARE env,
+    default ~/Projects/coldcard-firmware) OR a real MK4 with
+    COLDCARD_PHYSICAL=1. The simulator is auto-launched, auto-switched to
+    XRT, and transactions are approved automatically.
   - bitcoind/bitcoin-cli in PATH
   - embit: pip install embit
   - server/server.py for regtest node
@@ -28,6 +32,7 @@ import os
 import signal
 import socket
 import subprocess
+import coldcard_sim
 import sys
 import time
 import traceback
@@ -53,13 +58,13 @@ def detect_coldcard():
     Returns (xfp, addr, pubkey) or raises RuntimeError.
     Uses ckcc xfp + ckcc pubkey only (no ckcc addr, which blocks
     the device waiting for user to dismiss the on-screen display)."""
-    result = subprocess.run(["ckcc", "xfp"], capture_output=True, text=True, timeout=30)
+    result = subprocess.run(coldcard_sim.ckcc("xfp"), capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc xfp failed: {result.stderr.strip()}")
     xfp = result.stdout.strip()
     time.sleep(1)  # let Coldcard USB settle between commands
 
-    result = subprocess.run(["ckcc", "pubkey", CC_DERIV_PATH],
+    result = subprocess.run(coldcard_sim.ckcc("pubkey", CC_DERIV_PATH),
                             capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc pubkey failed: {result.stderr.strip()}")
@@ -182,6 +187,10 @@ def run_tests():
         server_proc, health = start_server(port)
         test("regtest server started", True)
 
+        # The simulator must be up BEFORE any ckcc call: detect_coldcard()
+        # falls through to a physical device when the socket is not live yet.
+        coldcard_sim.start_simulator(chain="XRT")
+
         # Detect Coldcard AFTER server is started
         print("  Auto-detecting Coldcard device info...")
         try:
@@ -195,7 +204,7 @@ def run_tests():
 
         # Verify chain is regtest
         time.sleep(0.5)  # let USB settle after detect_coldcard
-        chain_result = subprocess.run(["ckcc", "chain"], capture_output=True, text=True, timeout=30)
+        chain_result = subprocess.run(coldcard_sim.ckcc("chain"), capture_output=True, text=True, timeout=30)
         chain = chain_result.stdout.strip()
         test("Coldcard chain is XRT (regtest)", chain == "XRT", f"got '{chain}'")
         if chain != "XRT":
@@ -281,6 +290,18 @@ def run_tests():
         test("bip32Derivation set on CC input", bool(psbt.inputs[0].bip32_derivations))
 
         # Pre-sign WIF input (single partially-signed PSBT approach)
+        # Give the pre-signed WIF input a bip32Derivation keyed by its own
+        # fingerprint (hash160(pubkey)[:4]) -- what Sparrow/Electrum emit for
+        # imported keys. Current firmware master (the simulator) crashes in
+        # psbt.validate ("object of type 'NoneType' has no len()") on an input
+        # that has partial_sigs but no derivation entries; release device
+        # firmware tolerated the omission. Foreign fingerprint => Coldcard
+        # correctly treats the input as not-ours either way.
+        from embit import hashes as embit_hashes
+        psbt.inputs[1].bip32_derivations[wif_pubkey] = DerivationPath(
+            fingerprint=embit_hashes.hash160(wif_pubkey.sec())[:4], derivation=[0, 0])
+        test("WIF input carries its own-key bip32Derivation", bool(psbt.inputs[1].bip32_derivations))
+
         wif_sigs = psbt.sign_with(wif_privkey)
         test("WIF input pre-signed", wif_sigs > 0, f"signed {wif_sigs} inputs")
 
@@ -314,14 +335,15 @@ def run_tests():
             os.remove(psbt_out_path)
 
         print("  Sending PSBT to Coldcard for signing...")
-        print("  >>> APPROVE THE TRANSACTION ON YOUR COLDCARD <<<")
+        if coldcard_sim.using_simulator():
+            print("  (simulator: approving automatically)")
+        else:
+            print("  >>> APPROVE THE TRANSACTION ON YOUR COLDCARD <<<")
         print()
 
-        # ckcc sign: uploads PSBT, waits for user approval, downloads signed result
+        # ckcc sign: uploads PSBT, waits for approval, downloads signed result
         # Do NOT use -f (finalize) — we want partial_sigs so we can inspect them
-        sign_result = subprocess.run(
-            ["ckcc", "sign", psbt_in_path, psbt_out_path],
-            capture_output=True, text=True, timeout=300)  # 5 min timeout for user approval
+        sign_result = coldcard_sim.sign_psbt(psbt_in_path, psbt_out_path)
 
         test("ckcc sign succeeded", sign_result.returncode == 0,
              f"stderr: {sign_result.stderr.strip()}")
@@ -517,8 +539,8 @@ def run_tests():
 
 def main():
     print("=" * 60)
-    print("  Coldcard MK4 CLI Signing Test")
-    print("  (Real device — approve transaction on Coldcard)")
+    print("  Coldcard CLI Signing Test")
+    print("  (simulator preferred; COLDCARD_PHYSICAL=1 for a real device)")
     print("=" * 60)
 
     run_tests()

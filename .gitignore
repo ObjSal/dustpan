@@ -145,3 +145,4 @@ CLAUDE.md
 # Test scratch
 tests/__pycache__/
 tests/_tmp_cc/
+tests/_logs/

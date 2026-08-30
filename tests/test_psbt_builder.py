@@ -2351,6 +2351,361 @@ def run_tests(page, base_url):
     test("resetAll clears the broadcast preview",
          page.evaluate("() => { const b = document.getElementById('finalTxPreview'); return getComputedStyle(b).display === 'none' && b.innerHTML === ''; }"))
 
+    # ========================================================
+    section("42. Legacy-scriptSig guard + HW key-origin warnings")
+    # ========================================================
+    # Real-world fixture: a mainnet 2-in/2-out sweep where the signer of input 0
+    # (a P2WPKH UTXO) produced a P2PKH-style scriptSig and an empty witness --
+    # the Coldcard Q auto-finalize bug. Input 1 is correct. The tx is
+    # consensus-invalid ("Witness requires empty scriptSig"); nothing is spent.
+    BAD_TX = "0200000000010242c6b974a9fb749357d49d77effe5e216b9b606894af1e56e0a8a5516bd95df2000000006a473044022053733cbc7d91ede7aeacc16760894db0e266d242770f0a9c72a0ff69cb3c0f52022058a526b945fb999c95b9ffa59ad4ba5bd3dfd3da861f314be770bf11a10749f70121039e4729b1b69afedf9ba8f180f86cce7ab34e4f5fae6e95798644b5faf3e57e2ffdffffffec6a25d25a97f649d467ebb98b6e38a0abbf4234e5c6fc9b043a7d99219299031400000000fdffffff0280969800000000001600141f65d7846679eb769965636b0ba931a266ee19ba30de170000000000160014a00ebe6286ada0a39bb3f28c3700bf1d9c81a8210002473044022078972ac496e6cbb175f0868eab9fa10761dd8479df3d849480e6844feb403d1b022049e0e640110789fbd6f090532c5e1cdaee77ce881deaeabba9f1e4ce34c4eb28012102d9f02d154f40dd3abfcaaa135d63ab5e6b4e9b6debc526fe8ae68ef82d4c053d54b80e00"
+    page.select_option("#network", "mainnet")
+    time.sleep(1)
+
+    r = page.evaluate("""() => ({
+        p2wpkh: window._fn.isWitnessProgramScript('0014' + 'ab'.repeat(20)),
+        p2wsh: window._fn.isWitnessProgramScript('0020' + 'ab'.repeat(32)),
+        p2tr: window._fn.isWitnessProgramScript('5120' + 'ab'.repeat(32)),
+        p2sh: window._fn.isWitnessProgramScript('a914' + 'ab'.repeat(20) + '87'),
+        p2pkh: window._fn.isWitnessProgramScript('76a914' + 'ab'.repeat(20) + '88ac'),
+        short: window._fn.isWitnessProgramScript('0014abcd'),
+    })""")
+    test("isWitnessProgramScript: P2WPKH/P2WSH/P2TR yes", r["p2wpkh"] and r["p2wsh"] and r["p2tr"])
+    test("isWitnessProgramScript: P2SH/P2PKH/malformed no", not r["p2sh"] and not r["p2pkh"] and not r["short"])
+
+    r = page.evaluate("(ps) => ps.map(p => window._fn.looksLikeAccountPath(p))",
+                      ["m/84'/0'/0'", "m/84h/0h/0h", "m/49'/0'/0'", "m/84'/0'/0'/0/5", "m/84'/0'/0'/1/0", "0/5", "m/0'"])
+    test("looksLikeAccountPath: account paths flagged", r[0] and r[1] and r[2] and r[6])
+    test("looksLikeAccountPath: key paths not flagged", not r[3] and not r[4] and not r[5])
+
+    # Rows for the fixture's two outpoints (both P2WPKH), as the page would hold them
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        window._fn.addFetchedInput('f25dd96b51a5a8e0561eaf9468609b6b215efeef779dd4579374fba974b9c642', 0, 9999654,
+            '0014cb307ab14ce3a66b8a4a4c1e06c4718b7ea0d0f0', 'bc1qevc84v2vuwnxhzj2fs0qd3r33dl2p58swwurtn');
+        window._fn.addFetchedInput('03999221997d3a049bfcc6e53442bfaba0386e8bb9eb67d449f6975ad2256aec', 20, 1564763,
+            '0014b4a2e0b13c7cb5ae724259248cb057cc3d663bd2', 'bc1qkj3wpvfu0j66uujztyjgevzhes7kvw7jc2nxnl');
+    }""")
+    rows = page.evaluate("() => Object.fromEntries(window._fn.rowScriptsByOutpoint())")
+    test("rowScriptsByOutpoint: both rows mapped", len(rows) == 2 and
+         rows.get("f25dd96b51a5a8e0561eaf9468609b6b215efeef779dd4579374fba974b9c642:0", "").startswith("0014"))
+    err = page.evaluate("(h) => window._fn.checkFinalTxWitness(h)", BAD_TX)
+    test("checkFinalTxWitness: flags the P2PKH-style input 0", err is not None and "input 0" in err, str(err)[:80])
+    test("checkFinalTxWitness: does not flag the correct input 1", err is not None and "input 1" not in err)
+    test("checkFinalTxWitness: explains the Coldcard Q bug and the fix",
+         err is not None and "Coldcard Q" in err and "-signed.psbt" in err)
+    test("checkFinalTxWitness: unparsable hex is left to the node (null)", page.evaluate("() => window._fn.checkFinalTxWitness('zz')") is None)
+
+    # Broadcast is blocked for that tx
+    page.evaluate("(h) => { window._fn.finalTxHex = h; window._fn.finalPsbt = null; }", BAD_TX)
+    _all_dialogs.clear()
+    page.evaluate("() => window._fn.showCard('cardBroadcast')")
+    page.evaluate("() => document.getElementById('broadcastSection').style.display = ''")
+    page.click("#broadcastTx")
+    time.sleep(1)
+    test("broadcast: refused with the witness explanation",
+         any("Not broadcasting" in d and "input 0" in d for d in _all_dialogs), f"{_all_dialogs}")
+
+    # Scanned raw tx with the same defect is rejected before it is accepted
+    _all_dialogs.clear()
+    page.evaluate("() => { window._fn.finalTxHex = null; }")
+    page.evaluate("(h) => window._fn.handleScannedQR(h)", BAD_TX)
+    time.sleep(0.5)
+    test("QR scan: legacy-scriptSig tx rejected",
+         any("Scanned transaction rejected" in d for d in _all_dialogs) and page.evaluate("() => window._fn.finalTxHex") is None,
+         f"{_all_dialogs[:1]}")
+
+    # A correct P2WPKH tx passes: sign a fresh 1-in/1-out with a WIF
+    ok_hex = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        document.getElementById('utxoContainer').innerHTML = '';
+        window._fn.addFetchedInput('ee'.repeat(32), 3, 100000, spk, p2w.address);
+        const psbt = window._fn.createPsbtFromInputs([{ txid: 'ee'.repeat(32), vout: 3, value: 100000, scriptPubKey: spk }],
+            [{ address: p2w.address, value: 90000 }], 0, '');
+        window._fn.signInputWithWif(psbt, 0, kp.toWIF(), net);
+        psbt.finalizeAllInputs();
+        window.__okPsbt = psbt;
+        return psbt.extractTransaction().toHex();
+    }""")
+    test("checkFinalTxWitness: correct witness spend passes", page.evaluate("(h) => window._fn.checkFinalTxWitness(h)", ok_hex) is None)
+
+    # Combine guard: an uploaded PSBT whose P2WPKH input was pre-finalized with a
+    # P2PKH-style scriptSig (what the CC Q writes) is rejected by name, before
+    # finalizeAllInputs() turns it into an opaque error.
+    r = page.evaluate("""() => {
+        const B = window._Buffer; const bitcoin = window._bitcoin;
+        const good = window.__okPsbt;
+        const okErr = window._fn.checkPsbtFinalizedInputs(good);
+        // Rebuild the same input, then forge a legacy finalization from the real witness items
+        const bad = bitcoin.Psbt.fromHex(good.toHex());
+        const w = good.data.inputs[0].finalScriptWitness;
+        // decode witness vector: [count][len sig][sig][len pub][pub]
+        let o = 0; const cnt = w[o++]; const items = [];
+        for (let k = 0; k < cnt; k++) { const n = w[o++]; items.push(B.from(w.slice(o, o + n))); o += n; }
+        const scriptSig = bitcoin.script.compile(items);
+        bad.data.inputs[0].finalScriptWitness = undefined;
+        delete bad.data.inputs[0].finalScriptWitness;
+        bad.data.inputs[0].finalScriptSig = scriptSig;
+        window._fn.psbtAccumulator.length = 0;
+        window._fn.addPsbtToList('cc-final.psbt', 'file', new Uint8Array(bad.toBuffer()));
+        return { okErr, badErr: window._fn.checkPsbtFinalizedInputs(bad) };
+    }""")
+    test("checkPsbtFinalizedInputs: correct finalized PSBT passes", r["okErr"] is None)
+    test("checkPsbtFinalizedInputs: legacy finalScriptSig on P2WPKH flagged",
+         r["badErr"] is not None and "input 0" in r["badErr"] and "Coldcard Q" in r["badErr"], str(r["badErr"])[:80])
+    page.evaluate("() => { window._fn.showCard('cardBroadcast'); document.getElementById('combineSection').style.display = ''; }")
+    _all_dialogs.clear()
+    page.click("#combinePsbt")
+    time.sleep(1)
+    test("combine: rejects the legacy-finalized PSBT with the explanation",
+         any("input 0" in d and "Coldcard Q" in d for d in _all_dialogs), f"{[d[:80] for d in _all_dialogs]}")
+    page.evaluate("() => { window._fn.psbtAccumulator.length = 0; window._fn.renderPsbtList(); window._fn.showCard('cardCreate'); }")
+
+    # Create-time warnings: xfp + path but no pubkey; account-level path with pubkey
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addInput(null, 'aa'.repeat(32), 0, 100000, spk);   // manual row: has HW fields
+        window._fn.rawTxCache.set('aa'.repeat(32), '00');
+        const row = document.querySelector('#utxoContainer [data-utxo]');
+        row.querySelector('.hw-xfp').value = '34c2083e';
+        row.querySelector('.hw-path').value = "m/84'/0'/0'";
+        document.getElementById('softwareSignerOverride').checked = false;
+        window.__pub = B.from(kp.publicKey).toString('hex');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        window._fn.tipHeight = 900000;
+        document.querySelectorAll('.locktime-preset').forEach(b => b.classList.toggle('active', b.dataset.mode === 'block'));
+        document.getElementById('locktimeBlock').value = '900000';
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    for _ in range(50):
+        if any("Cannot create the PSBT" in d for d in _all_dialogs): break
+        time.sleep(0.2)
+    test("create: BLOCKED when xfp + path but no pubkey (no override)",
+         any("Cannot create the PSBT" in d and "aa" * 32 + ":0" in d and "missing: public key" in d for d in _all_dialogs),
+         f"{[d[:70] for d in _all_dialogs]}")
+    test("create: block message points at the zpub route", any("zpub" in d and "Sparrow" in d and "Coldcard" in d for d in _all_dialogs))
+    test("create: no account-path warning without a pubkey", not any("account-level" in d for d in _all_dialogs))
+
+    page.evaluate("() => { document.querySelector('#utxoContainer [data-utxo] .hw-pubkey').value = window.__pub; }")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    for _ in range(50):
+        if any("account-level" in d for d in _all_dialogs): break
+        time.sleep(0.2)
+    test("create: warns about an account-level path once a pubkey is present",
+         any("account-level" in d and "m/84'/0'/0'" in d for d in _all_dialogs), f"{[d[:70] for d in _all_dialogs]}")
+    test("create: not blocked once key origin is complete", not any("Cannot create the PSBT" in d for d in _all_dialogs))
+
+    page.evaluate("""() => { document.querySelector('#utxoContainer [data-utxo] .hw-path').value = "m/84'/0'/0'/0/5"; }""")
+    _all_dialogs.clear()
+    page.evaluate("() => { document.getElementById('psbtHex').textContent = ''; }")
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => (document.getElementById('psbtHex').textContent || '').length > 0", timeout=5000)
+    except Exception:
+        pass
+    r = page.evaluate("""() => {
+        const hex = document.getElementById('psbtHex').textContent || '';
+        if (!hex) return { built: false };
+        const d = window._bitcoin.Psbt.fromHex(hex).data.inputs[0].bip32Derivation || [];
+        return { built: true, n: d.length, path: d[0] && d[0].path, xfp: d[0] && window._Buffer.from(d[0].masterFingerprint).toString('hex') };
+    }""")
+    test("create: full path + pubkey + xfp -> no warnings", not any("account-level" in d or "Cannot create" in d for d in _all_dialogs), f"{[d[:70] for d in _all_dialogs]}")
+    test("create: bip32Derivation written with the full path", r.get("built") and r.get("n") == 1 and r.get("path") == "m/84'/0'/0'/0/5" and r.get("xfp") == "34c2083e", f"{r}")
+    page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = true; }")
+
+    # ========================================================
+    section("44. Key-origin rule: WIF or xfp+path+pubkey, else blocked")
+    # ========================================================
+
+    # Address-fetched rows carry no editable HW fields, only the zpub hint;
+    # xpub-scanned rows keep the (pre-filled) fields; WIF rows keep the WIF box.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('a1'.repeat(32), 0, 100000, spk, p2w.address);
+        window._fn.addFetchedInput('a2'.repeat(32), 0, 100000, spk, p2w.address,
+            { xpub: 'xpubPLACEHOLDER', path: "m/84'/0'/0'/0/0", pubkey: B.from(kp.publicKey).toString('hex') });
+        window._fn.addFetchedInput('a3'.repeat(32), 0, 100000, spk, p2w.address, null, kp.toWIF());
+        const rows = document.querySelectorAll('#utxoContainer [data-utxo]');
+        const has = (row, sel) => !!row.querySelector(sel);
+        return {
+            addr: { hint: has(rows[0], '.hw-hint'), fields: has(rows[0], '.hw-xfp'), hintText: (rows[0].querySelector('.hw-hint') || {}).textContent || '' },
+            xpub: { hint: has(rows[1], '.hw-hint'), fields: has(rows[1], '.hw-xfp'), pub: rows[1].querySelector('.hw-pubkey').value.length },
+            wif:  { hint: has(rows[2], '.hw-hint'), fields: has(rows[2], '.hw-xfp'), wifBox: has(rows[2], '.wif-key') },
+        };
+    }""")
+    test("address row: zpub hint, no editable HW fields", r["addr"]["hint"] and not r["addr"]["fields"] and "zpub" in r["addr"]["hintText"])
+    test("xpub-scanned row: HW fields present and pre-filled", r["xpub"]["fields"] and not r["xpub"]["hint"] and r["xpub"]["pub"] == 66)
+    test("WIF row: no hint, no HW fields, WIF box present", not r["wif"]["hint"] and not r["wif"]["fields"] and r["wif"]["wifBox"])
+
+    # The rule itself
+    r = page.evaluate("""() => {
+        const u = (o) => Object.assign({ txid: 'ab'.repeat(32), vout: 0, xfp: '', derivationPath: '', pubkey: '', wif: '' }, o);
+        const full = u({ xfp: '34c2083e', derivationPath: "m/84'/0'/0'/0/0", pubkey: '02' + '11'.repeat(32) });
+        return {
+            wifOk: window._fn.inputsMissingKeyOrigin([u({ wif: 'Kxyz' })]).length,
+            fullOk: window._fn.inputsMissingKeyOrigin([full]).length,
+            none: window._fn.inputsMissingKeyOrigin([u({})]).length,
+            noXfp: window._fn.inputsMissingKeyOrigin([u({ derivationPath: "m/84'/0'/0'/0/0", pubkey: '02' + '11'.repeat(32) })]).length,
+            noPath: window._fn.inputsMissingKeyOrigin([u({ xfp: '34c2083e', pubkey: '02' + '11'.repeat(32) })]).length,
+            noPub: window._fn.inputsMissingKeyOrigin([u({ xfp: '34c2083e', derivationPath: "m/84'/0'/0'/0/0" })]).length,
+            msg: window._fn.missingKeyOriginMessage(window._fn.inputsMissingKeyOrigin([u({ xfp: '34c2083e' })])),
+        };
+    }""")
+    test("rule: WIF input passes", r["wifOk"] == 0)
+    test("rule: complete key origin passes", r["fullOk"] == 0)
+    test("rule: nothing at all is missing key origin", r["none"] == 1)
+    test("rule: missing fingerprint alone is blocked", r["noXfp"] == 1)
+    test("rule: missing path alone is blocked", r["noPath"] == 1)
+    test("rule: missing pubkey alone is blocked", r["noPub"] == 1)
+    test("rule: message lists exactly what is missing", "missing: path, public key" in r["msg"], r["msg"][:120])
+
+    # Through the UI: an address-fetched row with no WIF is blocked unless the
+    # software-signer claim is ticked; a WIF row is never blocked.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('b1'.repeat(32), 0, 100000, spk, p2w.address);
+        window._fn.rawTxCache.set('b1'.repeat(32), '00');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        window._fn.tipHeight = 900000;
+        document.getElementById('locktimeBlock').value = '900000';
+        document.getElementById('softwareSignerOverride').checked = false;
+        document.getElementById('psbtHex').textContent = '';
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    for _ in range(50):
+        if any("Cannot create the PSBT" in d for d in _all_dialogs): break
+        time.sleep(0.2)
+    test("UI: address row without WIF is blocked (override off)",
+         any("Cannot create the PSBT" in d and "b1" * 32 + ":0" in d for d in _all_dialogs), f"{[d[:60] for d in _all_dialogs]}")
+    test("UI: nothing built while blocked", page.evaluate("() => (document.getElementById('psbtHex').textContent || '').length") == 0)
+
+    page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = true; }")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => (document.getElementById('psbtHex').textContent || '').length > 0", timeout=8000)
+    except Exception:
+        pass
+    test("UI: software-signer claim lets it through", page.evaluate("() => (document.getElementById('psbtHex').textContent || '').length") > 0, f"{[d[:60] for d in _all_dialogs]}")
+    test("UI: no block dialog with the claim ticked", not any("Cannot create the PSBT" in d for d in _all_dialogs))
+
+    # WIF row, override off: never blocked
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('b2'.repeat(32), 0, 100000, spk, p2w.address, null, kp.toWIF());
+        window._fn.rawTxCache.set('b2'.repeat(32), '00');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        document.getElementById('softwareSignerOverride').checked = false;
+        window._fn.updateStepLayout();
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => !!window._fn.finalTxHex", timeout=8000)
+    except Exception:
+        pass
+    test("UI: WIF-only sweep is not blocked with the claim off", page.evaluate("() => !!window._fn.finalTxHex"), f"{[d[:60] for d in _all_dialogs]}")
+
+    # Defaults: off for real users, on in test mode, restored by resetAll
+    fresh = page.context.new_page()
+    fresh.goto(base_url)
+    fresh.wait_for_function("() => document.getElementById('softwareSignerOverride') !== null", timeout=20000)
+    test("default: software-signer claim is OFF outside test mode", fresh.evaluate("() => document.getElementById('softwareSignerOverride').checked") is False)
+    fresh.close()
+    page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = false; window._fn.resetAll(); }")
+    test("resetAll: restores the test-mode default (on)", page.evaluate("() => document.getElementById('softwareSignerOverride').checked") is True)
+
+    # A fingerprint typed into ANY label of an xpub scan mirrors to the scan's
+    # other labels (one is created per address-type + chain group) and their rows.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    r = page.evaluate("""() => {
+        const c = document.getElementById('utxoContainer');
+        const mk = (xpub, tag) => {
+            const label = document.createElement('div');
+            label.className = 'utxo-source-label';
+            label.setAttribute('data-xpub-source', xpub);
+            label.innerHTML = `${tag} <input class="xpub-xfp">`;
+            c.appendChild(label);
+            const xfpInput = label.querySelector('.xpub-xfp');
+            xfpInput.addEventListener('input', () => {
+                const val = xfpInput.value.trim();
+                let el = label.nextElementSibling;
+                while (el && !el.classList.contains('utxo-source-label')) {
+                    if (el.hasAttribute('data-utxo')) {
+                        const hwXfp = el.querySelector('.hw-xfp');
+                        if (hwXfp) hwXfp.value = val;
+                    }
+                    el = el.nextElementSibling;
+                }
+                document.querySelectorAll('.utxo-source-label[data-xpub-source]').forEach(other => {
+                    if (other === label) return;
+                    if (other.getAttribute('data-xpub-source') !== xpub) return;
+                    const otherXfp = other.querySelector('.xpub-xfp');
+                    if (otherXfp && otherXfp.value !== xfpInput.value) {
+                        otherXfp.value = xfpInput.value;
+                        otherXfp.dispatchEvent(new Event('input'));
+                    }
+                });
+            });
+            return label;
+        };
+        // scan A: two groups; scan B (different xpub): one group
+        mk('xpubAAA', 'A-receive');
+        window._fn.addInput(null, '11'.repeat(32), 0, 1000, '0014' + 'aa'.repeat(20));
+        mk('xpubAAA', 'A-change');
+        window._fn.addInput(null, '22'.repeat(32), 0, 1000, '0014' + 'bb'.repeat(20));
+        mk('xpubBBB', 'B-receive');
+        window._fn.addInput(null, '33'.repeat(32), 0, 1000, '0014' + 'cc'.repeat(20));
+        const first = c.querySelector('.xpub-xfp');
+        first.value = 'deadbeef';
+        first.dispatchEvent(new Event('input'));
+        const rows = [...c.querySelectorAll('[data-utxo] .hw-xfp')].map(i => i.value);
+        const labels = [...c.querySelectorAll('.xpub-xfp')].map(i => i.value);
+        return { rows, labels };
+    }""")
+    test("xfp mirrors across the same scan's labels and rows",
+         r["rows"][0] == "deadbeef" and r["rows"][1] == "deadbeef" and r["labels"][1] == "deadbeef", f"{r}")
+    test("xfp does not leak into a different xpub's label",
+         r["labels"][2] == "" and r["rows"][2] == "", f"{r}")
+    page.evaluate("() => window._fn.resetAll()")
+
 
 # ============================================================
 # Main
