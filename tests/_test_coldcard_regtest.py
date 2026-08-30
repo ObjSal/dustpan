@@ -187,6 +187,10 @@ def run_tests():
         server_proc, health = start_server(port)
         test("regtest server started", True)
 
+        # The simulator must be up BEFORE any ckcc call: detect_coldcard()
+        # falls through to a physical device when the socket is not live yet.
+        coldcard_sim.start_simulator(chain="XRT")
+
         # Detect Coldcard AFTER server is started
         print("  Auto-detecting Coldcard device info...")
         try:
@@ -198,7 +202,6 @@ def run_tests():
 
         test("ckcc can reach Coldcard", len(xfp) == 8, f"xfp='{xfp}'")
 
-        coldcard_sim.start_simulator(chain="XRT")
         # Verify chain is regtest
         time.sleep(0.5)  # let USB settle after detect_coldcard
         chain_result = subprocess.run(coldcard_sim.ckcc("chain"), capture_output=True, text=True, timeout=30)

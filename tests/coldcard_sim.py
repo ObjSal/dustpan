@@ -88,6 +88,10 @@ def start_simulator(chain=None):
             ["python3", "headless.py"], cwd=unix_dir,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
+        # Never leak the simulator past the test run that launched it (a
+        # pre-existing one is left alone: _started_proc stays None for it).
+        import atexit
+        atexit.register(stop_simulator)
         for _ in range(60):
             if os.path.exists(SIM_SOCKET):
                 break
@@ -101,15 +105,29 @@ def start_simulator(chain=None):
 
 
 def stop_simulator():
-    """Stop the simulator ONLY if this run launched it."""
+    """Stop the simulator ONLY if this run launched it. headless.py runs the
+    firmware (coldcard-mpy) as a child in the same new session, so kill the
+    whole process group -- terminating just headless.py orphans the firmware
+    and leaks the socket."""
     global _started_proc
     if _started_proc is not None:
-        _started_proc.terminate()
+        import signal
+        try:
+            os.killpg(os.getpgid(_started_proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            _started_proc.terminate()
         try:
             _started_proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            _started_proc.kill()
+            try:
+                os.killpg(os.getpgid(_started_proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                _started_proc.kill()
         _started_proc = None
+        try:
+            os.unlink(SIM_SOCKET)
+        except OSError:
+            pass
 
 
 class Approver:
