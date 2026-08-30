@@ -2472,11 +2472,12 @@ def run_tests(page, base_url):
         const kp = window._ECPair.makeRandom({ network: net });
         const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
         const spk = B.from(p2w.output).toString('hex');
-        window._fn.addFetchedInput('aa'.repeat(32), 0, 100000, spk, p2w.address);
+        window._fn.addInput(null, 'aa'.repeat(32), 0, 100000, spk);   // manual row: has HW fields
         window._fn.rawTxCache.set('aa'.repeat(32), '00');
         const row = document.querySelector('#utxoContainer [data-utxo]');
         row.querySelector('.hw-xfp').value = '34c2083e';
         row.querySelector('.hw-path').value = "m/84'/0'/0'";
+        document.getElementById('softwareSignerOverride').checked = false;
         window.__pub = B.from(kp.publicKey).toString('hex');
         window._fn.addOutput(null, p2w.address, 90000);
         document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
@@ -2490,10 +2491,12 @@ def run_tests(page, base_url):
     _all_dialogs.clear()
     page.click("#createPsbt")
     for _ in range(50):
-        if any("public key" in d for d in _all_dialogs): break
+        if any("Cannot create the PSBT" in d for d in _all_dialogs): break
         time.sleep(0.2)
-    test("create: warns when xfp + path but no pubkey",
-         any("no public key" in d and "aa" * 32 + ":0" in d for d in _all_dialogs), f"{[d[:70] for d in _all_dialogs]}")
+    test("create: BLOCKED when xfp + path but no pubkey (no override)",
+         any("Cannot create the PSBT" in d and "aa" * 32 + ":0" in d and "missing: public key" in d for d in _all_dialogs),
+         f"{[d[:70] for d in _all_dialogs]}")
+    test("create: block message points at the zpub route", any("zpub" in d and "Sparrow" in d and "Coldcard" in d for d in _all_dialogs))
     test("create: no account-path warning without a pubkey", not any("account-level" in d for d in _all_dialogs))
 
     page.evaluate("() => { document.querySelector('#utxoContainer [data-utxo] .hw-pubkey').value = window.__pub; }")
@@ -2504,7 +2507,7 @@ def run_tests(page, base_url):
         time.sleep(0.2)
     test("create: warns about an account-level path once a pubkey is present",
          any("account-level" in d and "m/84'/0'/0'" in d for d in _all_dialogs), f"{[d[:70] for d in _all_dialogs]}")
-    test("create: no missing-pubkey warning once a pubkey is present", not any("no public key" in d for d in _all_dialogs))
+    test("create: not blocked once key origin is complete", not any("Cannot create the PSBT" in d for d in _all_dialogs))
 
     page.evaluate("""() => { document.querySelector('#utxoContainer [data-utxo] .hw-path').value = "m/84'/0'/0'/0/5"; }""")
     _all_dialogs.clear()
@@ -2520,8 +2523,134 @@ def run_tests(page, base_url):
         const d = window._bitcoin.Psbt.fromHex(hex).data.inputs[0].bip32Derivation || [];
         return { built: true, n: d.length, path: d[0] && d[0].path, xfp: d[0] && window._Buffer.from(d[0].masterFingerprint).toString('hex') };
     }""")
-    test("create: full path + pubkey + xfp -> no warnings", not any("account-level" in d or "no public key" in d for d in _all_dialogs), f"{[d[:70] for d in _all_dialogs]}")
+    test("create: full path + pubkey + xfp -> no warnings", not any("account-level" in d or "Cannot create" in d for d in _all_dialogs), f"{[d[:70] for d in _all_dialogs]}")
     test("create: bip32Derivation written with the full path", r.get("built") and r.get("n") == 1 and r.get("path") == "m/84'/0'/0'/0/5" and r.get("xfp") == "34c2083e", f"{r}")
+    page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = true; }")
+
+    # ========================================================
+    section("44. Key-origin rule: WIF or xfp+path+pubkey, else blocked")
+    # ========================================================
+
+    # Address-fetched rows carry no editable HW fields, only the zpub hint;
+    # xpub-scanned rows keep the (pre-filled) fields; WIF rows keep the WIF box.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    r = page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('a1'.repeat(32), 0, 100000, spk, p2w.address);
+        window._fn.addFetchedInput('a2'.repeat(32), 0, 100000, spk, p2w.address,
+            { xpub: 'xpubPLACEHOLDER', path: "m/84'/0'/0'/0/0", pubkey: B.from(kp.publicKey).toString('hex') });
+        window._fn.addFetchedInput('a3'.repeat(32), 0, 100000, spk, p2w.address, null, kp.toWIF());
+        const rows = document.querySelectorAll('#utxoContainer [data-utxo]');
+        const has = (row, sel) => !!row.querySelector(sel);
+        return {
+            addr: { hint: has(rows[0], '.hw-hint'), fields: has(rows[0], '.hw-xfp'), hintText: (rows[0].querySelector('.hw-hint') || {}).textContent || '' },
+            xpub: { hint: has(rows[1], '.hw-hint'), fields: has(rows[1], '.hw-xfp'), pub: rows[1].querySelector('.hw-pubkey').value.length },
+            wif:  { hint: has(rows[2], '.hw-hint'), fields: has(rows[2], '.hw-xfp'), wifBox: has(rows[2], '.wif-key') },
+        };
+    }""")
+    test("address row: zpub hint, no editable HW fields", r["addr"]["hint"] and not r["addr"]["fields"] and "zpub" in r["addr"]["hintText"])
+    test("xpub-scanned row: HW fields present and pre-filled", r["xpub"]["fields"] and not r["xpub"]["hint"] and r["xpub"]["pub"] == 66)
+    test("WIF row: no hint, no HW fields, WIF box present", not r["wif"]["hint"] and not r["wif"]["fields"] and r["wif"]["wifBox"])
+
+    # The rule itself
+    r = page.evaluate("""() => {
+        const u = (o) => Object.assign({ txid: 'ab'.repeat(32), vout: 0, xfp: '', derivationPath: '', pubkey: '', wif: '' }, o);
+        const full = u({ xfp: '34c2083e', derivationPath: "m/84'/0'/0'/0/0", pubkey: '02' + '11'.repeat(32) });
+        return {
+            wifOk: window._fn.inputsMissingKeyOrigin([u({ wif: 'Kxyz' })]).length,
+            fullOk: window._fn.inputsMissingKeyOrigin([full]).length,
+            none: window._fn.inputsMissingKeyOrigin([u({})]).length,
+            noXfp: window._fn.inputsMissingKeyOrigin([u({ derivationPath: "m/84'/0'/0'/0/0", pubkey: '02' + '11'.repeat(32) })]).length,
+            noPath: window._fn.inputsMissingKeyOrigin([u({ xfp: '34c2083e', pubkey: '02' + '11'.repeat(32) })]).length,
+            noPub: window._fn.inputsMissingKeyOrigin([u({ xfp: '34c2083e', derivationPath: "m/84'/0'/0'/0/0" })]).length,
+            msg: window._fn.missingKeyOriginMessage(window._fn.inputsMissingKeyOrigin([u({ xfp: '34c2083e' })])),
+        };
+    }""")
+    test("rule: WIF input passes", r["wifOk"] == 0)
+    test("rule: complete key origin passes", r["fullOk"] == 0)
+    test("rule: nothing at all is missing key origin", r["none"] == 1)
+    test("rule: missing fingerprint alone is blocked", r["noXfp"] == 1)
+    test("rule: missing path alone is blocked", r["noPath"] == 1)
+    test("rule: missing pubkey alone is blocked", r["noPub"] == 1)
+    test("rule: message lists exactly what is missing", "missing: path, public key" in r["msg"], r["msg"][:120])
+
+    # Through the UI: an address-fetched row with no WIF is blocked unless the
+    # software-signer claim is ticked; a WIF row is never blocked.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('b1'.repeat(32), 0, 100000, spk, p2w.address);
+        window._fn.rawTxCache.set('b1'.repeat(32), '00');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        window._fn.tipHeight = 900000;
+        document.getElementById('locktimeBlock').value = '900000';
+        document.getElementById('softwareSignerOverride').checked = false;
+        document.getElementById('psbtHex').textContent = '';
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    for _ in range(50):
+        if any("Cannot create the PSBT" in d for d in _all_dialogs): break
+        time.sleep(0.2)
+    test("UI: address row without WIF is blocked (override off)",
+         any("Cannot create the PSBT" in d and "b1" * 32 + ":0" in d for d in _all_dialogs), f"{[d[:60] for d in _all_dialogs]}")
+    test("UI: nothing built while blocked", page.evaluate("() => (document.getElementById('psbtHex').textContent || '').length") == 0)
+
+    page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = true; }")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => (document.getElementById('psbtHex').textContent || '').length > 0", timeout=8000)
+    except Exception:
+        pass
+    test("UI: software-signer claim lets it through", page.evaluate("() => (document.getElementById('psbtHex').textContent || '').length") > 0, f"{[d[:60] for d in _all_dialogs]}")
+    test("UI: no block dialog with the claim ticked", not any("Cannot create the PSBT" in d for d in _all_dialogs))
+
+    # WIF row, override off: never blocked
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    page.evaluate("""() => {
+        const net = window._fn.getSelectedNetwork(); const B = window._Buffer;
+        const kp = window._ECPair.makeRandom({ network: net });
+        const p2w = window._bitcoin.payments.p2wpkh({ pubkey: B.from(kp.publicKey), network: net });
+        const spk = B.from(p2w.output).toString('hex');
+        window._fn.addFetchedInput('b2'.repeat(32), 0, 100000, spk, p2w.address, null, kp.toWIF());
+        window._fn.rawTxCache.set('b2'.repeat(32), '00');
+        window._fn.addOutput(null, p2w.address, 90000);
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+        document.getElementById('softwareSignerOverride').checked = false;
+        window._fn.updateStepLayout();
+    }""")
+    page.fill("#feeRate", "1")
+    _all_dialogs.clear()
+    page.click("#createPsbt")
+    try:
+        page.wait_for_function("() => !!window._fn.finalTxHex", timeout=8000)
+    except Exception:
+        pass
+    test("UI: WIF-only sweep is not blocked with the claim off", page.evaluate("() => !!window._fn.finalTxHex"), f"{[d[:60] for d in _all_dialogs]}")
+
+    # Defaults: off for real users, on in test mode, restored by resetAll
+    fresh = page.context.new_page()
+    fresh.goto(base_url)
+    fresh.wait_for_function("() => document.getElementById('softwareSignerOverride') !== null", timeout=20000)
+    test("default: software-signer claim is OFF outside test mode", fresh.evaluate("() => document.getElementById('softwareSignerOverride').checked") is False)
+    fresh.close()
+    page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = false; window._fn.resetAll(); }")
+    test("resetAll: restores the test-mode default (on)", page.evaluate("() => document.getElementById('softwareSignerOverride').checked") is True)
 
 
 # ============================================================

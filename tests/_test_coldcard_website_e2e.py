@@ -51,6 +51,7 @@ def start_http_server(port):
 
 # Derivation path for the Coldcard input (BIP84, first receive address)
 CC_PATH = "m/84'/1'/0'/0/0"
+CC_ACCOUNT_PATH = "m/84h/1h/0h"   # ckcc xpub wants h-notation
 
 MEMPOOL_API = "https://mempool.space/testnet4/api"
 
@@ -65,9 +66,11 @@ def pubkey_to_p2wpkh(pubkey_hex, network):
 
 def detect_coldcard():
     """Auto-detect Coldcard device info via ckcc CLI.
-    Returns (xfp, addr, pubkey) or raises RuntimeError.
-    Uses ckcc xfp + ckcc pubkey only (no ckcc addr, which blocks
-    the device waiting for user to dismiss the on-screen display)."""
+    Returns (xfp, addr, pubkey, account_xpub) or raises RuntimeError.
+    Uses ckcc xfp + ckcc pubkey + ckcc xpub only (no ckcc addr, which
+    blocks the device waiting for user to dismiss the on-screen display).
+    The account xpub is what the website is fed: a plain address cannot be
+    given a key origin by hand any more, the xpub fetch supplies it."""
     result = subprocess.run(["ckcc", "xfp"], capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc xfp failed: {result.stderr.strip()}")
@@ -83,8 +86,15 @@ def detect_coldcard():
     # Derive address locally from pubkey (avoids ckcc addr which
     # shows address on Coldcard screen and blocks USB until dismissed)
     addr = pubkey_to_p2wpkh(pubkey, "test")
+    time.sleep(1)
 
-    return xfp, addr, pubkey
+    result = subprocess.run(["ckcc", "xpub", CC_ACCOUNT_PATH],
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"ckcc xpub failed: {result.stderr.strip()}")
+    account_xpub = result.stdout.strip()
+
+    return xfp, addr, pubkey, account_xpub
 
 # ============================================================
 # Test infra
@@ -148,7 +158,7 @@ def run_tests():
     # Auto-detect Coldcard device info
     print("  Auto-detecting Coldcard device info...")
     try:
-        CC_XFP, CC_ADDR, CC_PUBKEY = detect_coldcard()
+        CC_XFP, CC_ADDR, CC_PUBKEY, CC_XPUB = detect_coldcard()
     except RuntimeError as e:
         test("ckcc can reach Coldcard", False, str(e))
         return
@@ -216,9 +226,12 @@ def run_tests():
         wif_utxo_count = page.locator("#utxoContainer [data-utxo]").count()
         test("WIF UTXOs fetched", wif_utxo_count >= 1, f"found {wif_utxo_count}")
 
-        # Fetch CC address UTXOs
-        print("  Fetching CC UTXOs...")
-        page.fill("#fetchAddress", CC_ADDR)
+        # Fetch CC UTXOs by the ACCOUNT XPUB. The website no longer lets a
+        # plain address row be given HW info by hand (it cannot be done
+        # correctly without the per-address pubkey); the xpub scan fills the
+        # path and pubkey for every UTXO and the fingerprint is typed once.
+        print("  Fetching CC UTXOs by account xpub...")
+        page.fill("#fetchAddress", CC_XPUB)
         page.click("#fetchUtxosBtn")
         # Wait for more UTXOs to appear
         page.wait_for_timeout(5000)
@@ -229,45 +242,23 @@ def run_tests():
              f"total={total_utxo_count}, wif={wif_utxo_count}, cc={cc_utxo_count}")
 
         # ========================================================
-        section("3. Set HW Wallet Info for CC UTXOs")
+        section("3. Master fingerprint for the CC xpub source")
         # ========================================================
 
-        # CC UTXOs need HW wallet info (xfp, pubkey, path)
-        # They are plain address fetches, so HW fields are empty
-        # Find CC UTXO rows (ones without data-wif)
-        all_utxo_rows = page.locator("#utxoContainer [data-utxo]").all()
-        cc_rows = []
-        for row in all_utxo_rows:
-            has_wif = row.get_attribute("data-wif")
-            if not has_wif:
-                cc_rows.append(row)
+        # The xpub scan pre-filled path + pubkey on every CC row; the
+        # fingerprint cannot be derived from an xpub, so it is typed once in
+        # the source label and propagates to each row's .hw-xfp.
+        xfp_label = page.locator("#utxoContainer .utxo-source-label[data-xpub-source] .xpub-xfp")
+        test("CC xpub source label has a fingerprint field", xfp_label.count() >= 1)
+        xfp_label.first.fill(CC_XFP)
+        xfp_label.first.dispatch_event("input")
+        page.wait_for_timeout(300)
 
-        test("found CC rows without WIF", len(cc_rows) >= 1, f"found {len(cc_rows)}")
-
-        for row in cc_rows:
-            # Expand HW wallet section
-            hw_toggle = row.locator(".hw-toggle")
-            if hw_toggle.count() > 0:
-                hw_toggle.click()
-                page.wait_for_timeout(200)
-
-            # Fill in HW wallet fields
-            xfp_input = row.locator(".hw-xfp")
-            path_input = row.locator(".hw-path")
-            pubkey_input = row.locator(".hw-pubkey")
-
-            if xfp_input.count() > 0:
-                xfp_input.fill(CC_XFP)
-            if path_input.count() > 0:
-                path_input.fill(CC_PATH)
-            if pubkey_input.count() > 0 and not pubkey_input.get_attribute("readonly"):
-                pubkey_input.fill(CC_PUBKEY)
-
-        # Verify HW info was set
         hw_set = page.evaluate("""() => {
             const rows = document.querySelectorAll('#utxoContainer [data-utxo]');
             let hwCount = 0;
             for (const row of rows) {
+                if (row.getAttribute('data-wif')) continue;
                 const xfp = row.querySelector('.hw-xfp');
                 const path = row.querySelector('.hw-path');
                 const pubkey = row.querySelector('.hw-pubkey');
@@ -275,7 +266,15 @@ def run_tests():
             }
             return hwCount;
         }""")
-        test("HW wallet info set on CC UTXOs", hw_set >= 1, f"hw_set={hw_set}")
+        test("CC rows carry complete key origin (xfp + path + pubkey)", hw_set >= 1, f"hw_set={hw_set}")
+        cc_pub_match = page.evaluate("""(pub) => {
+            return Array.from(document.querySelectorAll('#utxoContainer [data-utxo]'))
+                .some(r => !r.getAttribute('data-wif') && r.querySelector('.hw-pubkey') && r.querySelector('.hw-pubkey').value === pub);
+        }""", CC_PUBKEY)
+        test("xpub-derived pubkey matches ckcc pubkey for the funded path", cc_pub_match)
+        # This suite drives the real UI: leave the software-signer claim OFF
+        # so Create is only allowed because every input has a WIF or key origin.
+        page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = false; }")
 
         # ========================================================
         section("4. Configure Output & Create PSBT")

@@ -324,6 +324,10 @@
     </div>
 
     <button id="createPsbt" class="btn-primary" style="margin-top:1rem;">Create PSBT</button>
+    <label id="softwareSignerOverrideLabel" style="display:flex;gap:0.5rem;align-items:flex-start;margin-top:0.6rem;font-size:0.8rem;color:var(--text-secondary);cursor:pointer;">
+      <input type="checkbox" id="softwareSignerOverride" style="margin-top:0.15rem;flex:0 0 auto;width:auto;">
+      <span>Inputs with no private key and no key origin will be signed by a <strong>software wallet that recognises its own addresses</strong> (Bitcoin Core, Sparrow, Electrum). A hardware wallet will <strong>not</strong> be able to sign them.</span>
+    </label>
 
     <div id="psbtResult" style="display:none; margin-top:1rem;">
       <details style="margin-bottom:0.5rem;">
@@ -1502,6 +1506,9 @@
       }
       updateTipAddress();
       updateTipSummary();
+      // Software-signer override is a per-transaction claim; clear it (tests
+      // keep it on, like the expanded sections, so legacy flows still build).
+      document.getElementById('softwareSignerOverride').checked = !!window.__TEST_MODE__;
       // Reset lock time to the default (current block height)
       resetLocktime();
       if (!window.__TEST_MODE__) {
@@ -1633,8 +1640,10 @@
           colourField(pubkeyInput, false);
         }
       }
-      xpubInput.addEventListener('input', tryDerivePubkey);
-      pathInput.addEventListener('input', tryDerivePubkey);
+      if (xpubInput && pathInput) {
+        xpubInput.addEventListener('input', tryDerivePubkey);
+        pathInput.addEventListener('input', tryDerivePubkey);
+      }
 
       // live script validation (unchanged)
       const scriptInput = div.querySelector('.script-input');
@@ -1704,7 +1713,7 @@
           <button type="button" class="remove">\u2715</button>
         </div>
         <div class="utxo-fetched-addr" title="${address}">${address}</div>
-
+        ${hwInfo ? `
         <span class="hw-toggle">HW wallet info \u25b8</span>
         <div class="hw-fields">
           <div class="row" style="margin-top:0.3rem;">
@@ -1717,7 +1726,10 @@
           <div class="row" style="margin-top:0.3rem;">
             <input class="grow hw-pubkey" placeholder="Public key (66 hex, compressed)">
           </div>
-        </div>
+        </div>` : (wif ? '' : `
+        <div class="hw-hint" style="font-size:0.78rem;color:var(--text-secondary);margin-top:0.3rem;">
+          Hardware wallet? Fetch with the wallet's <strong>zpub/xpub</strong> instead of this address &mdash; that adds the key origin (fingerprint, path, public key) the device needs to sign. A plain address cannot be given one.
+        </div>`)}
         <span class="wif-toggle">WIF private key \u25b8</span>
         <div class="wif-fields">
           <div class="row" style="margin-top:0.3rem;">
@@ -1736,25 +1748,26 @@
         updateStepLayout();
       });
 
+      // HW fields exist only on xpub-scanned rows (pre-populated). A plain
+      // address row cannot be given a correct key origin by hand, so it shows
+      // a hint pointing at the zpub fetch instead.
       const toggle = div.querySelector('.hw-toggle');
       const hwFields = div.querySelector('.hw-fields');
-      // Pre-populate HW wallet fields when provided by xpub scan
       const xpubInput = div.querySelector('.hw-xpub');
       const pathInput = div.querySelector('.hw-path');
       const pubkeyInput = div.querySelector('.hw-pubkey');
       const hwPrefix = hwInfo ? '\u2714\uFE0F ' : '';
-      if (hwInfo) {
+      if (hwInfo && toggle) {
         xpubInput.value = hwInfo.xpub;
         pathInput.value = hwInfo.path;
         pubkeyInput.value = hwInfo.pubkey;
         pubkeyInput.readOnly = true;
         toggle.textContent = hwPrefix + 'HW wallet info \u25b8';
+        toggle.addEventListener('click', () => {
+          const open = hwFields.classList.toggle('open');
+          toggle.textContent = hwPrefix + (open ? 'HW wallet info \u25be' : 'HW wallet info \u25b8');
+        });
       }
-
-      toggle.addEventListener('click', () => {
-        const open = hwFields.classList.toggle('open');
-        toggle.textContent = hwPrefix + (open ? 'HW wallet info \u25be' : 'HW wallet info \u25b8');
-      });
 
       // WIF toggle + pre-population
       const wifToggle = div.querySelector('.wif-toggle');
@@ -1773,6 +1786,7 @@
 
       // Auto-derive pubkey from xpub + path
       function tryDerivePubkey() {
+        if (!xpubInput || !pathInput || !pubkeyInput) return;
         const xpub = xpubInput.value.trim();
         const path = pathInput.value.trim();
         pubkeyInput.readOnly = !!xpub;
@@ -1787,8 +1801,10 @@
           colourField(pubkeyInput, false);
         }
       }
-      xpubInput.addEventListener('input', tryDerivePubkey);
-      pathInput.addEventListener('input', tryDerivePubkey);
+      if (xpubInput && pathInput) {
+        xpubInput.addEventListener('input', tryDerivePubkey);
+        pathInput.addEventListener('input', tryDerivePubkey);
+      }
     }
 
 
@@ -2001,6 +2017,30 @@
 
     // Native witness programs: P2WPKH (0014+20B), P2WSH (0020+32B), P2TR (5120+32B).
     // Consensus requires an EMPTY scriptSig when spending any of these.
+    function hasKeyOrigin(u) {
+      return !!(u.xfp && u.derivationPath && u.pubkey);
+    }
+    function inputsMissingKeyOrigin(utxos) {
+      return utxos.filter(u => !u.wif && !hasKeyOrigin(u));
+    }
+    function missingKeyOriginMessage(noKey) {
+      const list = noKey.map(u => {
+        const parts = [];
+        if (!u.xfp) parts.push('fingerprint');
+        if (!u.derivationPath) parts.push('path');
+        if (!u.pubkey) parts.push('public key');
+        return `  ${u.txid}:${u.vout}  (missing: ${parts.join(', ')})`;
+      }).join('\n');
+      return `Cannot create the PSBT: ${noKey.length} input(s) have no private key and no complete ` +
+        `key origin, so a hardware wallet cannot sign them:\n\n${list}\n\n` +
+        `Fix: fetch this wallet by its zpub/xpub instead of the address, then type the master ` +
+        `fingerprint once in the wallet's label. Every UTXO then carries its path and public key.\n` +
+        `  Sparrow: open the wallet, Settings tab, Keystore, copy the xPub.\n` +
+        `  Coldcard: Advanced/Tools > Export Wallet > Export XPUB (press 2 for zpub).\n\n` +
+        `If a software wallet that recognises its own addresses (Bitcoin Core, Sparrow, Electrum) ` +
+        `will sign these inputs instead, tick the box under the Create button.`;
+    }
+
     // True for paths like m/84'/0'/0' (every segment hardened, <=3 deep): an
     // account, not a key. Key paths end in unhardened chain/index segments.
     function looksLikeAccountPath(path) {
@@ -2488,27 +2528,16 @@
             wif: row.getAttribute('data-wif') || '',
           };
         });
-        // Warn if any input has pubkey+path but no master fingerprint
-        const missingXfp = utxos.filter(u => u.pubkey && u.derivationPath && !u.xfp);
-        if (missingXfp.length > 0) {
-          const ok = confirm(`${missingXfp.length} input(s) have HW wallet info but no master fingerprint. Your hardware wallet may not recognize these inputs.\n\nContinue anyway?`);
-          if (!ok) return;
-        }
-        // bip32Derivation needs xfp + path + pubkey. A row with the first two
-        // but no pubkey (and no xpub to derive it from) silently gets NO
-        // key-origin info, so the device has nothing to recognise the input by.
-        const missingPubkey = utxos.filter(u => u.xfp && u.derivationPath && !u.pubkey && !u.wif);
-        if (missingPubkey.length > 0) {
-          const list = missingPubkey.map(u => `  ${u.txid}:${u.vout}`).join('\n');
-          const ok = confirm(
-            `${missingPubkey.length} input(s) have a master fingerprint and derivation path but no ` +
-            `public key, so NO key-origin info will be written and your hardware wallet will not ` +
-            `recognise them:\n\n${list}\n\n` +
-            `Easiest fix: paste the wallet's account zpub/xpub into the fetch box instead of ` +
-            `individual addresses -- every UTXO then carries its path and public key, and you ` +
-            `type the fingerprint once. Otherwise enter the xpub in the row (the key is derived) ` +
-            `or the 66-hex public key for the FULL path (e.g. m/84'/0'/0'/0/5).\n\nContinue anyway?`);
-          if (!ok) return;
+        // The rule: every input needs either its private key (WIF) or complete
+        // key origin (fingerprint + full path + pubkey, what an xpub fetch
+        // gives). Without one of those a hardware wallet has nothing to
+        // recognise the input by, and in the field that ended as a P2WPKH
+        // input spent with a legacy scriptSig. Only an explicit claim that a
+        // software wallet (which matches by address) will sign lets it through.
+        const noKey = inputsMissingKeyOrigin(utxos);
+        if (noKey.length > 0 && !document.getElementById('softwareSignerOverride').checked) {
+          alert(missingKeyOriginMessage(noKey));
+          return;
         }
         // An account-level path (m/84'/0'/0') is not the key's path; the device
         // derives a different key there and cannot sign.
@@ -3241,6 +3270,7 @@
         updateTipSummary, recalcTipIfPreset, updateTipAddress, getTipOutputCount,
         get TIP_ADDRESSES() { return TIP_ADDRESSES; },
         // Witness / key-origin guards
+        hasKeyOrigin, inputsMissingKeyOrigin, missingKeyOriginMessage,
         isWitnessProgramScript, checkPsbtFinalizedInputs, checkFinalTxWitness,
         rowScriptsByOutpoint, looksLikeAccountPath,
         // Transaction preview (PSBT Decoder)
@@ -3274,6 +3304,10 @@
       document.getElementById('tipChevron').style.transform = '';
       document.getElementById('locktimeBody').style.display = '';
       document.getElementById('locktimeChevron').style.transform = '';
+      // Tests sign address-fetched inputs with Bitcoin Core (which matches by
+      // address), so the software-signer claim is on by default in test mode.
+      // Tests of the block itself untick it explicitly.
+      document.getElementById('softwareSignerOverride').checked = true;
     }
   </script>
 </body>
