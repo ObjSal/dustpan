@@ -1084,7 +1084,10 @@
 
               const label = document.createElement('div');
               label.className = 'utxo-source-label';
-              label.setAttribute('data-xpub-source', '');
+              // One scan = one wallet = one fingerprint: stamp the xpub so a
+              // fingerprint typed into ANY of this scan's labels mirrors to
+              // all of them (the scan creates one label per type+chain group).
+              label.setAttribute('data-xpub-source', xpubStr);
               const shortXpub = xpubStr.slice(0, 8) + '\u2026' + xpubStr.slice(-6);
               label.innerHTML = `From: ${shortXpub} (${addrType.type} ${chainLabel}) ` +
                 `<span style="float:right;color:#f7931a;font-weight:bold;">${chainBtc} BTC (${chainUtxoCount} UTXO${chainUtxoCount !== 1 ? 's' : ''})</span>` +
@@ -1104,6 +1107,17 @@
                   }
                   el = el.nextElementSibling;
                 }
+                // Mirror into this scan's other labels (same xpub) so every
+                // type+chain group -- and the rows under it -- get the value.
+                document.querySelectorAll('.utxo-source-label[data-xpub-source]').forEach(other => {
+                  if (other === label) return;
+                  if (other.getAttribute('data-xpub-source') !== xpubStr) return;
+                  const otherXfp = other.querySelector('.xpub-xfp');
+                  if (otherXfp && otherXfp.value !== xfpInput.value) {
+                    otherXfp.value = xfpInput.value;
+                    otherXfp.dispatchEvent(new Event('input'));
+                  }
+                });
               });
 
               for (const entry of found) {

@@ -2652,6 +2652,60 @@ def run_tests(page, base_url):
     page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = false; window._fn.resetAll(); }")
     test("resetAll: restores the test-mode default (on)", page.evaluate("() => document.getElementById('softwareSignerOverride').checked") is True)
 
+    # A fingerprint typed into ANY label of an xpub scan mirrors to the scan's
+    # other labels (one is created per address-type + chain group) and their rows.
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    r = page.evaluate("""() => {
+        const c = document.getElementById('utxoContainer');
+        const mk = (xpub, tag) => {
+            const label = document.createElement('div');
+            label.className = 'utxo-source-label';
+            label.setAttribute('data-xpub-source', xpub);
+            label.innerHTML = `${tag} <input class="xpub-xfp">`;
+            c.appendChild(label);
+            const xfpInput = label.querySelector('.xpub-xfp');
+            xfpInput.addEventListener('input', () => {
+                const val = xfpInput.value.trim();
+                let el = label.nextElementSibling;
+                while (el && !el.classList.contains('utxo-source-label')) {
+                    if (el.hasAttribute('data-utxo')) {
+                        const hwXfp = el.querySelector('.hw-xfp');
+                        if (hwXfp) hwXfp.value = val;
+                    }
+                    el = el.nextElementSibling;
+                }
+                document.querySelectorAll('.utxo-source-label[data-xpub-source]').forEach(other => {
+                    if (other === label) return;
+                    if (other.getAttribute('data-xpub-source') !== xpub) return;
+                    const otherXfp = other.querySelector('.xpub-xfp');
+                    if (otherXfp && otherXfp.value !== xfpInput.value) {
+                        otherXfp.value = xfpInput.value;
+                        otherXfp.dispatchEvent(new Event('input'));
+                    }
+                });
+            });
+            return label;
+        };
+        // scan A: two groups; scan B (different xpub): one group
+        mk('xpubAAA', 'A-receive');
+        window._fn.addInput(null, '11'.repeat(32), 0, 1000, '0014' + 'aa'.repeat(20));
+        mk('xpubAAA', 'A-change');
+        window._fn.addInput(null, '22'.repeat(32), 0, 1000, '0014' + 'bb'.repeat(20));
+        mk('xpubBBB', 'B-receive');
+        window._fn.addInput(null, '33'.repeat(32), 0, 1000, '0014' + 'cc'.repeat(20));
+        const first = c.querySelector('.xpub-xfp');
+        first.value = 'deadbeef';
+        first.dispatchEvent(new Event('input'));
+        const rows = [...c.querySelectorAll('[data-utxo] .hw-xfp')].map(i => i.value);
+        const labels = [...c.querySelectorAll('.xpub-xfp')].map(i => i.value);
+        return { rows, labels };
+    }""")
+    test("xfp mirrors across the same scan's labels and rows",
+         r["rows"][0] == "deadbeef" and r["rows"][1] == "deadbeef" and r["labels"][1] == "deadbeef", f"{r}")
+    test("xfp does not leak into a different xpub's label",
+         r["labels"][2] == "" and r["rows"][2] == "", f"{r}")
+    page.evaluate("() => window._fn.resetAll()")
+
 
 # ============================================================
 # Main

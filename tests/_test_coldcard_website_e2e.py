@@ -26,6 +26,7 @@ import os
 import re
 import socket
 import subprocess
+import coldcard_sim
 import sys
 import threading
 import time
@@ -71,13 +72,13 @@ def detect_coldcard():
     blocks the device waiting for user to dismiss the on-screen display).
     The account xpub is what the website is fed: a plain address cannot be
     given a key origin by hand any more, the xpub fetch supplies it."""
-    result = subprocess.run(["ckcc", "xfp"], capture_output=True, text=True, timeout=30)
+    result = subprocess.run(coldcard_sim.ckcc("xfp"), capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc xfp failed: {result.stderr.strip()}")
     xfp = result.stdout.strip()
     time.sleep(1)  # let Coldcard USB settle between commands
 
-    result = subprocess.run(["ckcc", "pubkey", CC_PATH],
+    result = subprocess.run(coldcard_sim.ckcc("pubkey", CC_PATH),
                             capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc pubkey failed: {result.stderr.strip()}")
@@ -88,7 +89,7 @@ def detect_coldcard():
     addr = pubkey_to_p2wpkh(pubkey, "test")
     time.sleep(1)
 
-    result = subprocess.run(["ckcc", "xpub", CC_ACCOUNT_PATH],
+    result = subprocess.run(coldcard_sim.ckcc("xpub", CC_ACCOUNT_PATH),
                             capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ckcc xpub failed: {result.stderr.strip()}")
@@ -150,7 +151,8 @@ def run_tests():
         return
 
     time.sleep(0.5)  # let USB settle
-    result = subprocess.run(["ckcc", "chain"], capture_output=True, text=True, timeout=30)
+    coldcard_sim.start_simulator(chain="XTN")
+    result = subprocess.run(coldcard_sim.ckcc("chain"), capture_output=True, text=True, timeout=30)
     test("Coldcard chain is XTN", result.stdout.strip() == "XTN")
     if result.stdout.strip() != "XTN":
         return
@@ -168,6 +170,8 @@ def run_tests():
     print(f"  Pubkey: {CC_PUBKEY}")
 
     # Check both addresses have UTXOs
+    if coldcard_sim.using_simulator():
+        coldcard_sim.ensure_testnet4_funds(CC_ADDR, wif_key, wif_address, MEMPOOL_API)
     cc_utxos = fetch_json(f"{MEMPOOL_API}/address/{CC_ADDR}/utxo")
     wif_utxos = fetch_json(f"{MEMPOOL_API}/address/{wif_address}/utxo")
     test("CC has UTXOs on testnet4", len(cc_utxos) >= 1)
@@ -209,7 +213,8 @@ def run_tests():
         page.wait_for_function("() => window._fn !== undefined", timeout=15000)
 
         # Auto-accept dialogs (e.g. missing XFP warning)
-        page.on("dialog", lambda d: d.accept())
+        _dialogs = []
+        page.on("dialog", lambda d: (_dialogs.append(d.message), d.accept()))
 
         # Select testnet4 (static server auto-selects testnet4, but be explicit)
         page.select_option("#network", "testnet")
@@ -309,9 +314,10 @@ def run_tests():
         }""")
         page.wait_for_timeout(300)
 
-        # Verify button says "Create & Partially Sign PSBT"
+        # Mixed WIF + HW mode: WIF signing is deferred to the combine step,
+        # so the button reads plain "Create PSBT".
         btn_text = page.locator("#createPsbt").inner_text()
-        test("button says partial sign", "Partially Sign" in btn_text, f"got: '{btn_text}'")
+        test("button says Create PSBT (mixed mode)", btn_text.strip() == "Create PSBT", f"got: '{btn_text}'")
 
         # Click Create (may fetch nonWitnessUtxo from mempool.space)
         print("  Creating PSBT...")
@@ -323,7 +329,9 @@ def run_tests():
         test("PSBT result visible", psbt_visible)
         if not psbt_visible:
             # Check for alert
-            print("  ❌ PSBT not created — check for errors")
+            print("  ❌ PSBT not created — dialogs seen:")
+            for d in _dialogs:
+                print(f"     - {d[:200]}")
             browser.close()
             return
 
@@ -349,10 +357,14 @@ def run_tests():
             }
             return { total: psbt.data.inputs.length, partial: partialCount };
         }""")
-        test("PSBT has partial sigs (WIF signed)", has_partial["partial"] >= 1,
+        # Deferred WIF signing: in mixed mode the created PSBT carries NO
+        # signatures at all -- WIF inputs are signed in the browser at the
+        # combine step, after the Coldcard returns its signature. (Pre-signed
+        # WIF inputs used to trigger the Coldcard Q auto-finalize bug.)
+        test("created PSBT is fully unsigned (WIF signing deferred)", has_partial["partial"] == 0,
              f"{has_partial['partial']}/{has_partial['total']} inputs have partial_sigs")
-        test("PSBT has unsigned inputs (for CC)", has_partial["partial"] < has_partial["total"],
-             f"all {has_partial['total']} are signed — nothing for CC to sign")
+        test("PSBT has inputs for the CC to sign", has_partial["total"] >= 2,
+             f"only {has_partial['total']} inputs")
 
         # ========================================================
         section("5. Sign with Coldcard")
@@ -362,12 +374,13 @@ def run_tests():
             os.remove(psbt_out_path)
 
         print("  Sending PSBT to Coldcard for signing...")
-        print("  >>> APPROVE THE TRANSACTION ON YOUR COLDCARD <<<")
+        if coldcard_sim.using_simulator():
+            print("  (simulator: approving automatically)")
+        else:
+            print("  >>> APPROVE THE TRANSACTION ON YOUR COLDCARD <<<")
         print()
 
-        sign_result = subprocess.run(
-            ["ckcc", "sign", psbt_in_path, psbt_out_path],
-            capture_output=True, text=True, timeout=300)
+        sign_result = coldcard_sim.sign_psbt(psbt_in_path, psbt_out_path)
 
         test("ckcc sign succeeded", sign_result.returncode == 0,
              f"stderr: {sign_result.stderr.strip()}")
