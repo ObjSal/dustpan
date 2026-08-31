@@ -46,7 +46,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_FILES = [ROOT / "vendor" / "deps.js", ROOT / "vendor" / "jsqr.js"]
+DEFAULT_FILES = [
+    ROOT / "vendor" / "deps.js",
+    ROOT / "vendor" / "jsqr.js",
+    # First-party files are scanned with the smaller FIRST_PARTY_PATTERNS table
+    # (see below); including them here means every routine build exercises it.
+    ROOT / "index.html",
+    ROOT / "qr_generator.js",
+    ROOT / "tools" / "qr-scanner.html",
+]
 
 # Basenames scanned with FIRST_PARTY_PATTERNS instead of PATTERNS -- see the module docstring.
 FIRST_PARTY_BASENAMES = {"index.html", "qr_generator.js", "qr-scanner.html"}
