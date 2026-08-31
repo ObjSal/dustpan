@@ -85,18 +85,35 @@ Modes
     --verify            -- rebuilds into a temp dir *without touching any committed file*,
                             compares sha256 of the rebuilt deps.js/jsqr.js against the committed
                             ones, then runs the audit + smoke test against the COMMITTED files.
-                            Green output is the proof the committed bundle matches pinned sources.
+                            Green output proves the committed bundle is CONSISTENT with the
+                            committed vendor/pins.json + vendor/package-lock.json -- i.e. that
+                            nobody hand-edited deps.js/jsqr.js after the fact, or bumped a pin
+                            without rebuilding. It does NOT prove the lockfile itself is honest:
+                            Track A only re-hashes the 11 packages named in pins.json, and Track B
+                            (npm resolving vendor/package-lock.json) reproduces byte-identically
+                            from a *poisoned* committed lockfile too, since npm is just replaying
+                            exactly what that file says to fetch. The actual defence against a
+                            bad transitive pin is human review of vendor/package-lock.json's diff
+                            on every change -- see --bump below.
     --check             -- informational only: prints pinned vs latest-on-npm for every pin.
     --bump pkg@version  -- re-pins exactly one package (hash-verifies the new tarball AND cross-
                             checks it against the registry's own dist.integrity for that version,
-                            aborting instead of pinning on any mismatch), forces a lockfile
-                            refresh, rebuilds, re-runs audit + smoke test, and reminds you to run
-                            tests/test_psbt_builder.py.
+                            aborting instead of pinning on any mismatch -- NOTE this dist.integrity
+                            check is a SELF-check: both values come from the same registry fetch
+                            path, so it catches transport corruption between the registry and this
+                            machine, not a malicious publish already sitting on the registry. It is
+                            not a second independent source), forces a lockfile refresh, rebuilds,
+                            re-runs audit + smoke test, and prints the three things a human MUST
+                            review before trusting the bump: the vendor/package-lock.json diff
+                            stat, a before/after diff of the bundle's module inventory, and the
+                            bumped version's registry publish timestamp + maintainer list. See
+                            cmd_bump()'s printed "MANDATORY HUMAN REVIEW" block for the full list.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import http.client
 import io
@@ -169,11 +186,14 @@ def _http_get_curl(url: str, timeout: int) -> bytes:
     # urllib retries). curl reliably completes the same downloads, so it is the primary path;
     # urllib stays as a fallback in case curl is unavailable on some future machine. curl is
     # invoked via subprocess, which is in this script's explicitly-allowed stdlib toolset.
+    # --proto '=https' refuses any scheme downgrade curl might otherwise follow through a
+    # redirect (e.g. an https->http bounce); --max-redirs 3 bounds how far a redirect chain
+    # can wander before curl gives up, instead of following it indefinitely.
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
         result = subprocess.run(
-            ["curl", "-sS", "-L", "--fail", "-m", str(timeout),
+            ["curl", "-sS", "-L", "--proto", "=https", "--max-redirs", "3", "--fail", "-m", str(timeout),
              "-H", f"User-Agent: {USER_AGENT}", "-o", str(tmp_path), url],
             capture_output=True, text=True,
         )
@@ -184,8 +204,23 @@ def _http_get_curl(url: str, timeout: int) -> bytes:
         tmp_path.unlink(missing_ok=True)
 
 
+# Every byte this script downloads must come from the npm registry -- no CDN, no redirect to a
+# lookalike host, no "just this once" exception. This is checked in http_get() itself (the one
+# function both Track A tarball verification and --bump's registry lookup/tarball fetch funnel
+# through), not at each call site, so nothing can accidentally bypass it.
+ALLOWED_HOST_PREFIX = "https://registry.npmjs.org/"
+
+
 def http_get(url: str, timeout: int = 30, retries: int = 3) -> bytes:
-    """Robust GET with a couple of retries, curl first (see _http_get_curl), urllib as fallback."""
+    """Robust GET with a couple of retries, curl first (see _http_get_curl), urllib as fallback.
+    Hard-fails on any URL that does not start with ALLOWED_HOST_PREFIX -- this script must never
+    fetch bytes from anywhere but the npm registry itself."""
+    if not url.startswith(ALLOWED_HOST_PREFIX):
+        fail(
+            f"refusing to download from a non-allowlisted host: {url!r}\n"
+            f"Every download this script makes must start with {ALLOWED_HOST_PREFIX!r}. "
+            f"This is a hard security boundary -- do not widen it to fetch this URL."
+        )
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         for getter in (_http_get_curl, _http_get_urllib):
@@ -320,7 +355,7 @@ def prepare_node_modules(build_dir: Path, pins: dict, npm_cache_dir: Path, allow
     if have_lock:
         shutil.copy(PACKAGE_LOCK_PATH, build_dir / "package-lock.json")
         result = subprocess.run(
-            ["npm", "ci", "--no-audit", "--no-fund", "--cache", str(npm_cache_dir)],
+            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache_dir)],
             cwd=str(build_dir),
         )
         if result.returncode == 0:
@@ -338,10 +373,21 @@ def prepare_node_modules(build_dir: Path, pins: dict, npm_cache_dir: Path, allow
         fail("no vendor/package-lock.json committed yet -- run `python3 tools/vendor-deps.py` "
              "(build) once before using --verify.")
 
-    run(["npm", "install", "--no-audit", "--no-fund", "--cache", str(npm_cache_dir)], cwd=build_dir)
+    run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache_dir)], cwd=build_dir)
     shutil.copy(build_dir / "package-lock.json", PACKAGE_LOCK_PATH)
     write_json_file(PACKAGE_JSON_PATH, pkg)
     return "install"
+
+
+def _esbuild_platform_child(build_dir: Path) -> Path | None:
+    """The single node_modules/@esbuild/<platform> dir that npm resolved for this machine
+    (esbuild ships its native binary as an os/cpu-gated optionalDependency, so only the
+    matching one is ever installed)."""
+    esbuild_scope = build_dir / "node_modules" / "@esbuild"
+    if esbuild_scope.is_dir():
+        for child in sorted(esbuild_scope.iterdir()):
+            return child
+    return None
 
 
 def detect_esbuild_platform_package(build_dir: Path) -> str:
@@ -350,15 +396,54 @@ def detect_esbuild_platform_package(build_dir: Path) -> str:
     try:
         esbuild_pkg = json.loads((build_dir / "node_modules" / "esbuild" / "package.json").read_text())
         version = esbuild_pkg.get("version", "?")
-        # esbuild's own package.json lists the resolved platform binary under optionalDependencies;
-        # find the one that actually got installed under node_modules/@esbuild/*.
-        esbuild_scope = build_dir / "node_modules" / "@esbuild"
-        if esbuild_scope.is_dir():
-            for child in sorted(esbuild_scope.iterdir()):
-                return f"@esbuild/{child.name}@{version}"
+        child = _esbuild_platform_child(build_dir)
+        if child is not None:
+            return f"@esbuild/{child.name}@{version}"
         return f"esbuild@{version} (no @esbuild/* platform package found under node_modules)"
     except Exception as exc:  # pragma: no cover - purely informational
         return f"(could not determine: {exc})"
+
+
+def resolve_esbuild_binary(build_dir: Path) -> Path:
+    """Returns the esbuild executable to run. Prefers the normal node_modules/.bin/esbuild
+    symlink (npm creates bin-links unconditionally -- that is not a lifecycle script, so
+    --ignore-scripts does not remove it). esbuild@0.28's JS wrapper (bin/esbuild) resolves
+    its native binary from the @esbuild/<platform> optionalDependency at require-time, with
+    no postinstall step, so the symlink should keep working under --ignore-scripts. If it is
+    somehow missing, fall back to invoking the platform package's own native binary directly
+    (its package.json "bin" field), skipping esbuild's JS wrapper entirely."""
+    bin_link = build_dir / "node_modules" / ".bin" / "esbuild"
+    if bin_link.exists():
+        return bin_link
+
+    log(f"  node_modules/.bin/esbuild not found at {bin_link}; falling back to the "
+        f"platform package's native binary directly.")
+    child = _esbuild_platform_child(build_dir)
+    if child is None:
+        fail(f"esbuild binary not found at {bin_link}, and no node_modules/@esbuild/<platform> "
+             f"package was installed to fall back to.")
+    pkg_json_path = child / "package.json"
+    try:
+        pkg = json.loads(pkg_json_path.read_text())
+    except Exception as exc:
+        fail(f"could not read {pkg_json_path} to locate the esbuild native binary: {exc}")
+    bin_field = pkg.get("bin")
+    if isinstance(bin_field, dict):
+        # Single-entry dict keyed by the bin name (always "esbuild" for these packages).
+        rel = next(iter(bin_field.values()))
+    elif isinstance(bin_field, str):
+        rel = bin_field
+    else:
+        # esbuild@0.28's @esbuild/<platform> packages ship the binary at the conventional
+        # bin/esbuild path without declaring a "bin" field in package.json at all (there is
+        # nothing for npm to bin-link -- these packages are optionalDependencies, not things
+        # you `npx`). Fall back to that convention.
+        rel = "bin/esbuild"
+    native_bin = child / rel
+    if not native_bin.exists():
+        fail(f"esbuild native binary not found at {native_bin} (from {pkg_json_path}'s \"bin\" field).")
+    log(f"  using native binary directly: {native_bin}")
+    return native_bin
 
 
 # --------------------------------------------------------------------------------------
@@ -431,9 +516,7 @@ def run_build_pipeline(pins: dict, downloaded: dict[str, bytes], allow_relock: b
         entry_src = render_entry_mjs(pins)
         (build_dir / "entry.mjs").write_text(entry_src)
 
-        esbuild_bin = build_dir / "node_modules" / ".bin" / "esbuild"
-        if not esbuild_bin.exists():
-            fail(f"esbuild binary not found at {esbuild_bin} after npm install")
+        esbuild_bin = resolve_esbuild_binary(build_dir)
 
         log("== Bundling vendor/deps.js with esbuild (no minification) ==")
         out_deps = build_dir / "deps.js"
@@ -521,6 +604,22 @@ def write_manifest(pins: dict, result: BuildResult) -> None:
     lines.append("a plain <script> and needs no bundling. Extracted from the Track-A-verified")
     lines.append("jsqr tarball bytes directly (see tools/vendor-deps.py).")
     lines.append("")
+    lines.append("NOTE: code not named ANYWHERE above or in vendor/package-lock.json")
+    lines.append("-" * 88)
+    lines.append("  bbqr@1.2.0 declares zero npm dependencies (its package.json has no")
+    lines.append("  \"dependencies\" field), but its published dist/bbqr.js pre-bundles its own")
+    lines.append("  copies of pako@2.1.0 (gzip/deflate, licensed MIT AND Zlib) and @scure/base")
+    lines.append("  (base32/base58 encoding) at PUBLISH time -- both appear inline in bbqr's own")
+    lines.append("  tarball with their own embedded license comments, not as separate npm")
+    lines.append("  packages. Neither is in vendor/pins.json (bbqr is the only pin that pulls")
+    lines.append("  them in, inlined) nor in vendor/package-lock.json under those inlined")
+    lines.append("  copies' names. (A DIFFERENT, separately-resolved @scure/base@1.2.6 -- pulled")
+    lines.append("  in transitively via bip32 -> wif -- IS in package-lock.json; that is not the")
+    lines.append("  same code path as bbqr's inlined copy.) Anyone treating package-lock.json as")
+    lines.append("  a complete inventory of the code in vendor/deps.js will miss these two --")
+    lines.append("  they are only visible in the module-inventory diff or by reading bbqr's own")
+    lines.append("  published tarball.")
+    lines.append("")
     MANIFEST_PATH.write_text("\n".join(lines) + "\n")
 
 
@@ -587,7 +686,13 @@ def cmd_verify() -> None:
 
     log("=" * 88)
     log("VERIFY OK -- committed vendor/deps.js and vendor/jsqr.js reproduce exactly from "
-        "vendor/pins.json, pass the supply-chain audit, and pass the crypto smoke test.")
+        "vendor/pins.json + vendor/package-lock.json, pass the supply-chain audit, and pass "
+        "the crypto smoke test.")
+    log("This proves lock<->bundle CONSISTENCY, not lockfile integrity: it re-hashes only the "
+        "11 packages named in pins.json against the registry. A committed package-lock.json "
+        "that already names a poisoned transitive package reproduces this same byte-identical "
+        "PASS, because npm just replays what that file says to fetch. The defence against that "
+        "is human review of vendor/package-lock.json's diff on every change, not this command.")
     log("=" * 88)
 
 
@@ -611,6 +716,16 @@ def cmd_check() -> None:
     for category, name, pinned, latest, status in rows:
         log(f"{category:<10}{name:<{name_w}}{pinned:<{pinned_w}}{latest:<{latest_w}}{status}")
     log("\n(informational only -- nothing was changed; use --bump pkg@version to update a pin)")
+
+
+def _module_inventory(path: Path) -> list[str]:
+    """The bundle's module inventory: esbuild's `// node_modules/<pkg>/...` comment above each
+    bundled module. A package newly entering the bundle (direct or transitive) shows up here as
+    one new line -- this is the human-visible signal for "--bump pulled in something extra"."""
+    if not path.exists():
+        return []
+    return [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.startswith("  // node_modules/")]
 
 
 def cmd_bump(spec: str) -> None:
@@ -649,8 +764,32 @@ def cmd_bump(spec: str) -> None:
             f"of overriding it."
         )
     log(f"  registry dist.integrity matches the downloaded tarball's sha512: {computed_integrity}")
+    log("  NOTE: this is a SELF-check, not independent verification -- both values came from the "
+        "same registry fetch path (this HTTP request), so it only catches transport corruption "
+        "between the registry and this machine, not a malicious version already published to "
+        "the registry. It is not a substitute for the human review below.")
+
+    # Registry publish provenance for the human review this bump requires: fetch the full
+    # packument (not the version-scoped one used above) to get time[version]; maintainers/
+    # _npmUser are read from the version-scoped packument, which reflects who published this
+    # specific version rather than the package's current maintainer list.
+    try:
+        full_meta = registry_packument(name)
+        publish_time = full_meta.get("time", {}).get(version, "(not found in registry time map)")
+    except Exception as exc:  # pragma: no cover - informational only
+        publish_time = f"(lookup failed: {exc})"
+    maintainers = meta.get("maintainers") or []
+    maintainer_str = ", ".join(f"{m.get('name', '?')} <{m.get('email', '?')}>" for m in maintainers) or "(none listed)"
+    npm_user = meta.get("_npmUser", {})
+    publisher_str = f"{npm_user.get('name', '?')} <{npm_user.get('email', '?')}>" if npm_user else "(unknown)"
 
     old_version = pins["esbuild"]["version"] if bucket is pins else bucket[name]["version"]
+
+    # "Before" snapshot of the bundle's module inventory, taken from the CURRENTLY COMMITTED
+    # vendor/deps.js -- i.e. before pins.json is rewritten and cmd_build() overwrites it below.
+    before_inventory = _module_inventory(DEPS_JS_PATH)
+    before_lock = PACKAGE_LOCK_PATH.read_text() if PACKAGE_LOCK_PATH.exists() else ""
+
     new_entry = {"version": version, "tarball": tarball_url, "integrity": computed_integrity}
     if bucket is pins:
         pins["esbuild"] = {**pins["esbuild"], **new_entry}
@@ -661,9 +800,49 @@ def cmd_bump(spec: str) -> None:
 
     cmd_build()
 
-    log("\nReminder: run `python3 tests/test_psbt_builder.py` (and the rest of "
-        "tests/run_all.py once index.html is rewired to use vendor/deps.js) before shipping "
-        f"this bump of {name}.")
+    log("\n" + "=" * 88)
+    log("MANDATORY HUMAN REVIEW -- do not ship this bump without reading all three of these")
+    log("=" * 88)
+
+    log("\n(1) vendor/package-lock.json diff --stat (the transitive tree this bump pulled in):")
+    diff_stat = subprocess.run(
+        ["git", "diff", "--stat", "--", "vendor/package-lock.json"],
+        cwd=str(ROOT), capture_output=True, text=True,
+    )
+    stat_output = diff_stat.stdout.strip()
+    log(stat_output if stat_output else "  (no changes -- resolved tree is identical)")
+    if diff_stat.returncode != 0:
+        log(f"  (git diff failed, exit {diff_stat.returncode}: {diff_stat.stderr.strip()})")
+
+    log("\n(2) Module inventory diff (esbuild's `// node_modules/<pkg>/...` comment lines) -- "
+        "any new package entering the bundle, direct or transitive, shows up here as one line:")
+    after_inventory = _module_inventory(DEPS_JS_PATH)
+    inventory_diff = list(difflib.unified_diff(
+        before_inventory, after_inventory,
+        fromfile="deps.js (before bump)", tofile="deps.js (after bump)", lineterm="",
+    ))
+    log("\n".join(inventory_diff) if inventory_diff else "  (no change -- identical set of bundled modules)")
+
+    log(f"\n(3) Registry provenance for {name}@{version}:")
+    log(f"  publish timestamp (time[{version!r}]): {publish_time}")
+    log(f"  published by (_npmUser):     {publisher_str}")
+    log(f"  current package maintainers: {maintainer_str}")
+
+    log("\n" + "-" * 88)
+    log("Before trusting this bump, a human must review, in full:")
+    log("  1. The complete vendor/package-lock.json diff (not just --stat above) -- "
+        "`git diff -- vendor/package-lock.json`.")
+    log("  2. The module inventory diff above -- confirm every new/changed line is an expected, "
+        "reviewed package.")
+    log(f"  3. A green `python3 tools/audit-vendor.py` (already ran above as part of the build) "
+        f"and a green unit suite (`python3 tests/test_psbt_builder.py`, and the rest of "
+        f"tests/run_all.py once index.html is rewired to use vendor/deps.js).")
+    log(f"  4. Whether the publish timestamp and maintainer list above look right for "
+        f"{name}@{version} -- an unexpected maintainer or a suspiciously fresh publish is a "
+        f"reason to stop and investigate, not to proceed.")
+    log("Remember: the dist.integrity cross-check earlier in this run is a self-check "
+        "(transport corruption only), and none of Track A/Track B/this bump independently "
+        "re-reviews the ~80 transitive packages -- steps 1-2 above are the actual review.")
 
 
 # --------------------------------------------------------------------------------------

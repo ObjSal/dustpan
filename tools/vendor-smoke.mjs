@@ -3,10 +3,13 @@
 //
 // Loads vendor/deps.js under a `window` stub (exactly as index.html will use it, just without
 // a real DOM) and asserts real crypto works end to end: WIF -> P2WPKH address, xpub child
-// derivation, bs58check round-trip, BBQr split/join round-trip, and that jsQR is callable.
-// Also separately verifies vendor/jsqr.js (the standalone file for tools/qr-scanner.html) sets
-// window.jsQR to a function when loaded as a plain <script> with no CommonJS module/exports in
-// scope. Exits non-zero on any failed assertion.
+// derivation against a BIP32 spec known-answer test, bs58check round-trip, BBQr split/join
+// round-trip, and that jsQR is callable. It also SIGNS against published known-answer test
+// vectors (RFC6979 deterministic ECDSA, BIP340 Schnorr) and checks the exact signature bytes --
+// derivation-only checks would not catch a tampered nonce/signing backdoor. Also separately
+// verifies vendor/jsqr.js (the standalone file for tools/qr-scanner.html) sets window.jsQR to a
+// function when loaded as a plain <script> with no CommonJS module/exports in scope. Exits
+// non-zero on any failed assertion.
 //
 // Run directly: node tools/vendor-smoke.mjs
 // Run as part of the pipeline: python3 tools/vendor-deps.py [--verify]
@@ -15,6 +18,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -78,18 +82,97 @@ assert(
 
 assert(typeof BIP32Factory === 'function', 'BIP32Factory is exposed as a callable function (not the raw CJS module object)');
 const bip32 = BIP32Factory(ecc);
-// BIP32 test vector 1 master xpub (well-known, https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki)
-const XPUB = 'xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8';
+// BIP32 spec TEST VECTOR 2 (https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
+// Chain m -> Chain m/0. Test vector 1's published chains are all reachable only through a
+// hardened first step (m/0'/...), which cannot be derived from a public xpub at all -- vector
+// 2's path (m/0/2147483647'/1/2147483646'/2) starts with a NON-hardened child, so both "m" and
+// "m/0"'s extended PUBLIC keys are published by the spec and reachable via .derive(0) alone.
+// This is a known-answer test of the actual derived xpub string, not just "did it throw".
+const XPUB2 = 'xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB';
+const EXPECTED_CHILD_XPUB = 'xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH';
 let child;
 let derivationThrew = false;
 try {
-  child = bip32.fromBase58(XPUB, bitcoin.networks.bitcoin).derive(0).derive(0);
+  child = bip32.fromBase58(XPUB2, bitcoin.networks.bitcoin).derive(0);
 } catch (err) {
   derivationThrew = true;
   console.error(err);
 }
-assert(!derivationThrew, 'bip32.fromBase58(xpub).derive(0).derive(0) does not throw');
-assert(!!child && child.publicKey && child.publicKey.length === 33, 'derived child 0/0 has a 33-byte compressed public key');
+assert(!derivationThrew, "bip32.fromBase58(BIP32 test vector 2's xpub).derive(0) does not throw");
+assert(
+  !!child && child.toBase58() === EXPECTED_CHILD_XPUB,
+  `bip32 derives BIP32 spec test vector 2's Chain m/0 xpub ${EXPECTED_CHILD_XPUB} (got ${child && child.toBase58()})`
+);
+
+// --- Part 1b: RFC6979 deterministic ECDSA sign (known-answer test) ------------------------
+//
+// ecc.sign(msgHash, privKey) must produce the exact signature bytes a correct, unbackdoored
+// RFC6979 + secp256k1 implementation produces -- a KAT that only asserts "does not throw" or
+// "has the right length" would pass even if e.g. the nonce (k) generation were tampered with
+// to leak the private key. Expected r/s below are NOT computed with tiny-secp256k1 (the
+// library under test). Derivation:
+//   1. The deterministic nonce k for secp256k1, sha256, private key 1, message "Satoshi
+//      Nakamoto" is a well-known published RFC6979 test vector (RFC 6979 itself has no
+//      secp256k1 vectors -- this one originates from an independent Go reference
+//      implementation) -- independently published and cross-confirmed in two unrelated
+//      projects' own test suites:
+//        k = 0x8F8A276C19F4149656B280621E358CCE24F5F52542772691EE69063B74F15D15
+//        - python-ecdsa: src/ecdsa/test_pyecdsa.py, class RFC6979.test_SECP256k1_3
+//          (https://github.com/tlsfuzzer/python-ecdsa)
+//        - trezor-firmware: crypto/tests/test_check.c, test_rfc6979
+//          (https://github.com/trezor/trezor-firmware)
+//   2. r, s were computed from that published k using the standard ECDSA equations
+//      (R = k*G; r = R.x mod n; s = k^-1*(z + r*privkey) mod n) via the `ecdsa` PyPI package
+//      (a separate, pure-Python implementation unrelated to tiny-secp256k1/libsecp256k1),
+//      then normalized to low-S (s' = n - s, since s > n/2) because libsecp256k1 -- which
+//      @bitcoin-js/tiny-secp256k1-asmjs wraps -- always returns the low-S form. (r, n-s) is a
+//      standard equivalent-and-valid ECDSA signature for the same message, independently
+//      re-verified with the same `ecdsa` package before being pinned here.
+const RFC6979_PRIVKEY = Buffer.from('0000000000000000000000000000000000000000000000000000000000000001', 'hex');
+const RFC6979_MSG_HASH = crypto.createHash('sha256').update('Satoshi Nakamoto').digest();
+const EXPECTED_RFC6979_SIG =
+  '934b1ea10a4b3c1757e2b0c017d0b6143ce3c9a7e6a4a49860d7a6ab210ee3d8' +
+  '2442ce9d2b916064108014783e923ec36b49743e2ffa1c4496f01a512aafd9e5';
+const rfc6979Sig = Buffer.from(ecc.sign(RFC6979_MSG_HASH, RFC6979_PRIVKEY)).toString('hex');
+assert(
+  rfc6979Sig === EXPECTED_RFC6979_SIG,
+  `ecc.sign reproduces the RFC6979 KAT for privkey=1, msg="Satoshi Nakamoto": ${EXPECTED_RFC6979_SIG} (got ${rfc6979Sig})`
+);
+const rfc6979Pub = ecc.pointFromScalar(RFC6979_PRIVKEY, true);
+assert(
+  ecc.verify(RFC6979_MSG_HASH, rfc6979Pub, Buffer.from(EXPECTED_RFC6979_SIG, 'hex')),
+  'ecc.verify accepts the RFC6979 KAT signature'
+);
+
+// --- Part 1c: BIP340 Schnorr sign (known-answer test) --------------------------------------
+//
+// Test vector index 0 from the BIP340 spec's own published CSV
+// (https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv), cited directly --
+// not computed with tiny-secp256k1. signSchnorr's third argument IS the BIP340 aux_rand input
+// (checked in tiny-secp256k1-asmjs's lib/index.js: `signSchnorr(h, d, e)` forwards `e` as the
+// wasm call's extra-entropy/aux-rand slot), so the all-zero aux_rand from the vector can be
+// passed straight through for a fully deterministic sign -- no verify-only fallback needed.
+const BIP340_PRIVKEY = Buffer.from('0000000000000000000000000000000000000000000000000000000000000003', 'hex');
+const BIP340_MSG = Buffer.alloc(32); // all-zero, per vector index 0
+const BIP340_AUX_RAND = Buffer.alloc(32); // all-zero, per vector index 0
+const EXPECTED_BIP340_PUBKEY = 'f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9';
+const EXPECTED_BIP340_SIG =
+  'e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821' +
+  '525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0';
+const bip340Sig = Buffer.from(ecc.signSchnorr(BIP340_MSG, BIP340_PRIVKEY, BIP340_AUX_RAND)).toString('hex');
+assert(
+  bip340Sig === EXPECTED_BIP340_SIG,
+  `ecc.signSchnorr reproduces BIP340 test vector 0: ${EXPECTED_BIP340_SIG} (got ${bip340Sig})`
+);
+const bip340XOnlyPub = Buffer.from(ecc.pointFromScalar(BIP340_PRIVKEY, true)).slice(1);
+assert(
+  bip340XOnlyPub.toString('hex') === EXPECTED_BIP340_PUBKEY,
+  `x-only pubkey for BIP340 vector 0's private key matches the published pubkey ${EXPECTED_BIP340_PUBKEY} (got ${bip340XOnlyPub.toString('hex')})`
+);
+assert(
+  ecc.verifySchnorr(BIP340_MSG, bip340XOnlyPub, Buffer.from(EXPECTED_BIP340_SIG, 'hex')),
+  'ecc.verifySchnorr accepts BIP340 test vector 0\'s published signature'
+);
 
 assert(typeof bs58check?.encode === 'function' && typeof bs58check?.decode === 'function', 'bs58check.encode/decode are exposed');
 const roundtripInput = Buffer.from('00112233445566778899aabbccddeeff0011223344', 'hex');

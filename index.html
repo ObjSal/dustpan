@@ -471,10 +471,13 @@
     // vendor/deps.js — a single local, auditable bundle built only from
     // hash-pinned npm tarballs (vendor/pins.json) by tools/vendor-deps.py.
     // `tools/vendor-deps.py --verify` re-checks every tarball hash against
-    // vendor/pins.json and vendor/MANIFEST; tools/audit-vendor.py diffs the
-    // built bundle against the vendored source for unexpected changes. To
-    // upgrade a dependency, run `python3 tools/vendor-deps.py --bump
-    // pkg@version` and rerun the unit suite — never add a CDN import here.
+    // vendor/pins.json and rebuilds the bundle byte-for-byte to prove it
+    // matches those pins; tools/audit-vendor.py is a separate pattern scan of
+    // the built bundle for network/exfil/dynamic-code primitives (fetch,
+    // eval, Function, etc.) — neither one diffs the bundle against its
+    // vendored source. To upgrade a dependency, run `python3
+    // tools/vendor-deps.py --bump pkg@version` and rerun the unit suite —
+    // never add a CDN import here.
     const { Buffer, bitcoin, ecc, BIP32Factory, ECPairFactory, bs58check, splitQRs, joinQRs, jsQR } = window.__vendor;
     window.Buffer = Buffer;
     bitcoin.initEccLib(ecc);
