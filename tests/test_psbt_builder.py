@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Playwright test suite for Bitcoin Address Sweeper.
+Playwright test suite for Dustpan (formerly Bitcoin Address Sweeper).
 
 Tests all pure functions via page.evaluate() and DOM interactions
 via Playwright actions. Runs against the real index.html in a browser.

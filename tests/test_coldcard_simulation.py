@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Coldcard signing simulation test for Bitcoin Address Sweeper.
+Coldcard signing simulation test for Dustpan (formerly Bitcoin Address Sweeper).
 
 Simulates Coldcard behavior using bitcoin-cli walletprocesspsbt with an
 imported Coldcard xpub descriptor wallet. This allows fully automated
