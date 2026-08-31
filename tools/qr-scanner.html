@@ -25,8 +25,9 @@
 <div id="status"></div>
 <div id="output"></div>
 
-<script type="module">
-import jsQR from "https://esm.sh/jsqr@1.4.0";
+<script src="../vendor/jsqr.js"></script>
+<script>
+const jsQR = window.jsQR;
 
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');

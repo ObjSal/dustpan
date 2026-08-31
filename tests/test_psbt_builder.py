@@ -14,7 +14,9 @@ Usage:
 """
 
 import http.server
+import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -2499,7 +2501,12 @@ def run_tests(page, base_url):
         // decode witness vector: [count][len sig][sig][len pub][pub]
         let o = 0; const cnt = w[o++]; const items = [];
         for (let k = 0; k < cnt; k++) { const n = w[o++]; items.push(B.from(w.slice(o, o + n))); o += n; }
-        const scriptSig = bitcoin.script.compile(items);
+        // vendor/entry.mjs deliberately exports only the bitcoin namespace members
+        // this app actually uses (no `script`), so compile a plain data-push
+        // scriptSig by hand instead of bitcoin.script.compile(items) — matches
+        // its output for pure data pushes (sig + pubkey are both < 0x4c bytes).
+        const pushData = (buf) => B.concat([B.from([buf.length]), buf]);
+        const scriptSig = B.concat(items.map(pushData));
         bad.data.inputs[0].finalScriptWitness = undefined;
         delete bad.data.inputs[0].finalScriptWitness;
         bad.data.inputs[0].finalScriptSig = scriptSig;
@@ -2869,6 +2876,110 @@ def run_tests(page, base_url):
     test("xfp does not leak into a different xpub's label",
          r["labels"][2] == "" and r["rows"][2] == "", f"{r}")
     page.evaluate("() => window._fn.resetAll()")
+
+    # ========================================================
+    section("46. Vendored Dependencies (no CDN)")
+    # ========================================================
+    # index.html was switched from 8 pinned CDN (esm.sh/jsdelivr) ES module
+    # imports to a single local, hash-verified bundle (vendor/deps.js, built
+    # by tools/vendor-deps.py from vendor/pins.json). These tests are the
+    # regression guard: the app must never silently regrow a CDN dependency.
+    CDN_HOST_RE = re.compile(r"esm\.sh|jsdelivr|cdn\.|unpkg", re.IGNORECASE)
+
+    # --- 46a: fresh load + a representative interaction makes zero CDN /
+    #     third-party-script requests. mempool.space data-fetch calls are
+    #     legitimate, pre-existing, documented app behaviour (see "API
+    #     Routing" in CLAUDE.md) and are stubbed here exactly like the rest
+    #     of this suite does — they are unrelated to the CDN-script supply
+    #     chain this test guards, so only CDN hosts and third-party *script*
+    #     loads are asserted against, not every fetch/xhr.
+    seen_requests = []
+    rec_page = page.context.new_page()
+    rec_page.on("request", lambda req: seen_requests.append({"url": req.url, "type": req.resource_type}))
+    rec_page.route("**/blocks/tip/height",
+                    lambda route, req: route.fulfill(status=200, content_type="text/plain", body="900000"))
+    rec_page.route("**/api/tx/*/hex", lambda route, req: route.fulfill(status=404, body="Transaction not found"))
+    rec_page.route("**/v1/fees/recommended", lambda route, req: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"fastestFee":3,"halfHourFee":2,"hourFee":1,"economyFee":1,"minimumFee":1}'))
+    rec_page.add_init_script("window.__TEST_MODE__ = true;")
+    rec_page.goto(base_url)
+    rec_page.wait_for_function("() => window._fn !== undefined", timeout=15000)
+
+    # Representative interaction: switch networks (exercises the tip-height
+    # re-fetch path, stubbed above) and open the HD import dialog through
+    # local xpub derivation — no UTXO fetch is ever triggered since Import
+    # is never clicked.
+    rec_page.select_option("#network", "testnet")
+    rec_page.select_option("#network", "regtest")
+    rec_page.select_option("#network", "mainnet")
+    rec_page.fill("#fetchAddress",
+                   "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
+    rec_page.click("#fetchUtxosBtn")
+    rec_page.wait_for_selector("#hdImportDialog", state="visible", timeout=8000)
+    rec_page.click("#hdImportCancel")
+    rec_page.close()
+
+    cdn_hits = [r["url"] for r in seen_requests if CDN_HOST_RE.search(r["url"])]
+    test("load + interaction: no request URL matches a known CDN host (esm.sh/jsdelivr/cdn./unpkg)",
+         cdn_hits == [], f"{cdn_hits}")
+    non_local_scripts = [r["url"] for r in seen_requests
+                          if r["type"] == "script" and "127.0.0.1" not in r["url"] and "localhost" not in r["url"]]
+    test("load + interaction: every script-type request is same-origin",
+         non_local_scripts == [], f"{non_local_scripts}")
+    test("load + interaction: requests were actually recorded (sanity)",
+         len(seen_requests) > 0, f"{seen_requests}")
+
+    # --- 46b: static guard — no CDN <script src> or import statement left on disk ---
+    script_src_re = re.compile(r'<script[^>]*\bsrc=["\']([^"\']+)["\']', re.IGNORECASE)
+    import_target_re = re.compile(
+        r'''\bimport\s*\(\s*["']([^"']+)["']|\bimport\b[^;'"()]*from\s+["']([^"']+)["']''')
+
+    for rel_path in ("index.html", "tools/qr-scanner.html"):
+        with open(os.path.join(_PROJECT_ROOT, rel_path), encoding="utf-8") as fh:
+            html_text = fh.read()
+        src_urls = script_src_re.findall(html_text)
+        import_urls = [a or b for (a, b) in import_target_re.findall(html_text)]
+        offenders = [u for u in (src_urls + import_urls) if CDN_HOST_RE.search(u)]
+        test(f"{rel_path}: no CDN <script src> or import statement remains",
+             offenders == [], f"{offenders}")
+
+    # --- 46c: vendor contract — window.__vendor is frozen and matches vendor/pins.json ---
+    with open(os.path.join(_PROJECT_ROOT, "vendor", "pins.json"), encoding="utf-8") as fh:
+        pins = json.load(fh)
+    expected_versions = {pkg: info["version"] for pkg, info in pins["packages"].items()}
+
+    vendor_state = page.evaluate("""() => {
+        const v = window.__vendor;
+        return v ? {
+            exists: true,
+            frozen: Object.isFrozen(v),
+            bitcoinFrozen: Object.isFrozen(v.bitcoin),
+            versionsFrozen: Object.isFrozen(v.VERSIONS),
+            versions: v.VERSIONS,
+        } : { exists: false };
+    }""")
+    test("window.__vendor exists", vendor_state.get("exists") is True)
+    test("window.__vendor is frozen (Object.freeze)", vendor_state.get("frozen") is True)
+    test("window.__vendor.bitcoin is frozen", vendor_state.get("bitcoinFrozen") is True)
+    test("window.__vendor.VERSIONS is frozen", vendor_state.get("versionsFrozen") is True)
+    test("window.__vendor.VERSIONS matches vendor/pins.json",
+         vendor_state.get("versions") == expected_versions,
+         f"{vendor_state.get('versions')} vs {expected_versions}")
+
+    # --- 46d: tools/qr-scanner.html loads jsQR from the vendored standalone bundle ---
+    qr_seen = []
+    qr_page = page.context.new_page()
+    qr_page.on("request", lambda req: qr_seen.append(req.url))
+    qr_url = base_url.rsplit("/", 1)[0] + "/tools/qr-scanner.html"
+    qr_page.goto(qr_url)
+    qr_page.wait_for_function("() => typeof window.jsQR === 'function'", timeout=8000)
+    jsqr_type = qr_page.evaluate("() => typeof window.jsQR")
+    qr_page.close()
+
+    test("tools/qr-scanner.html: window.jsQR is a function", jsqr_type == "function", jsqr_type)
+    qr_non_local = [u for u in qr_seen if "127.0.0.1" not in u and "localhost" not in u]
+    test("tools/qr-scanner.html: no external requests", qr_non_local == [], f"{qr_non_local}")
 
 
 # ============================================================
