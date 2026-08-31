@@ -1,0 +1,77 @@
+{
+  "_comment": "Source of truth for the vendored dependency bundle (vendor/deps.js, vendor/jsqr.js). Every entry's `integrity` was computed locally (sha512 of the downloaded tarball bytes) at pin time AND cross-checked against the npm registry packument's `dist.integrity` field for that exact version -- see vendor/MANIFEST for the pin date. Do not hand-edit a version or hash; use `python3 tools/vendor-deps.py --bump <pkg>@<version>`.",
+
+  "packages": {
+    "buffer": {
+      "version": "6.0.3",
+      "tarball": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+      "used_as": "Buffer"
+    },
+    "bitcoinjs-lib": {
+      "version": "7.0.1",
+      "tarball": "https://registry.npmjs.org/bitcoinjs-lib/-/bitcoinjs-lib-7.0.1.tgz",
+      "integrity": "sha512-vwEmpL5Tpj0I0RBdNkcDMXePoaYSTeKY6mL6/l5esbnTs+jGdPDuLp4NY1hSh6Zk5wSgePygZ4Wx5JJao30Pww==",
+      "used_as": "bitcoin.{initEccLib,address,networks,payments,crypto,Transaction,Psbt} (named imports only, so esbuild tree-shakes the rest)"
+    },
+    "bbqr": {
+      "version": "1.2.0",
+      "tarball": "https://registry.npmjs.org/bbqr/-/bbqr-1.2.0.tgz",
+      "integrity": "sha512-wB4UaSMcrnkQgq9ZFoWyvF3/tEAcnakb2n13D4PdppDl6FNvIM+RNmidD0UDeiL6C98syqTdmdD+czkKEgqmWg==",
+      "used_as": "splitQRs, joinQRs"
+    },
+    "jsqr": {
+      "version": "1.4.0",
+      "tarball": "https://registry.npmjs.org/jsqr/-/jsqr-1.4.0.tgz",
+      "integrity": "sha512-dxLob7q65Xg2DvstYkRpkYtmKm2sPJ9oFhrhmudT1dZvNFFTlroai3AWSpLey/w5vMcLBXRgOJsbXpdN9HzU/A==",
+      "used_as": "default export jsQR; also vendored standalone as vendor/jsqr.js from dist/jsQR.js (see MANIFEST)"
+    },
+    "@bitcoin-js/tiny-secp256k1-asmjs": {
+      "version": "2.2.3",
+      "tarball": "https://registry.npmjs.org/@bitcoin-js/tiny-secp256k1-asmjs/-/tiny-secp256k1-asmjs-2.2.3.tgz",
+      "integrity": "sha512-arFPdEZi9RIiaG76OZswTnAU0KfuiLwGw2VNfD66LKhzlbfOnX1o1WI/GI3qm9UbjG/0QOzZu/KmTNvL79x/DQ==",
+      "used_as": "ecc (whole namespace, asm.js build -- deliberately NOT tiny-secp256k1, which ships WASM)"
+    },
+    "bip32": {
+      "version": "4.0.0",
+      "tarball": "https://registry.npmjs.org/bip32/-/bip32-4.0.0.tgz",
+      "integrity": "sha512-aOGy88DDlVUhspIXJN+dVEtclhIsfAUppD43V0j40cPTld3pv/0X/MlrZSZ6jowIaQQzFwP8M6rFU2z2mVYjDQ==",
+      "used_as": "BIP32Factory (named import -- see vendor/entry.mjs comment on why not `import Foo from`)"
+    },
+    "bs58check": {
+      "version": "3.0.1",
+      "tarball": "https://registry.npmjs.org/bs58check/-/bs58check-3.0.1.tgz",
+      "integrity": "sha512-hjuuJvoWEybo7Hn/0xOrczQKKEKD63WguEjlhLExYs2wUBcebDC1jDNK17eEAD2lYfw82d5ASC1d7K3SWszjaQ==",
+      "used_as": "default export (.encode/.decode)"
+    },
+    "ecpair": {
+      "version": "3.0.0",
+      "tarball": "https://registry.npmjs.org/ecpair/-/ecpair-3.0.0.tgz",
+      "integrity": "sha512-kf4JxjsRQoD4EBzpYjGAcR0t9i/4oAeRPtyCpKvSwyotgkc6oA4E4M0/e+kep7cXe+mgxAvoeh/jdgH9h5+Wxw==",
+      "used_as": "ECPairFactory (named export)"
+    }
+  },
+
+  "shims": {
+    "_comment": "Not imported by our own entry.mjs. bip32@4.0.0 -> wif@2.0.6 -> bs58check@2.1.2 -> create-hash -> md5.js -> hash-base -> readable-stream@2 needs the node core modules 'stream' and 'events', which esbuild --platform=browser will not auto-polyfill. Pinned and hash-verified the same way as the direct imports since their code ends up in the shipped bundle.",
+    "events": {
+      "version": "3.3.0",
+      "tarball": "https://registry.npmjs.org/events/-/events-3.3.0.tgz",
+      "integrity": "sha512-mQw+2fkQbALzQ7V0MY0IqdnXNOeTtP4r0lN9z7AAawCXgqea7bDii20AYrIBrFd/Hx0M2Ocz6S111CaFkUcb0Q==",
+      "aliases": "events"
+    },
+    "stream-browserify": {
+      "version": "3.0.0",
+      "tarball": "https://registry.npmjs.org/stream-browserify/-/stream-browserify-3.0.0.tgz",
+      "integrity": "sha512-H73RAHsVBapbim0tU2JwwOiXUj+fikfiaoYAKHF3VJfA0pe2BCzkhAHBlLG6REzE+2WNZcxOXjK7lkso+9euLA==",
+      "aliases": "stream"
+    }
+  },
+
+  "esbuild": {
+    "version": "0.28.2",
+    "tarball": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+    "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
+    "note": "This is the small JS wrapper tarball. The actual native binary is an OS/arch-specific optionalDependency (e.g. @esbuild/darwin-arm64@0.28.2) resolved and integrity-checked by npm itself during install -- npm's own fetcher verifies every package's shasum/integrity against registry metadata unconditionally, so per-platform binaries are covered even though this script only hash-verifies the wrapper tarball directly. See vendor/MANIFEST for the exact platform binary used on the last build."
+  }
+}
