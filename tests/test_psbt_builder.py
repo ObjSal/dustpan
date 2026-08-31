@@ -111,10 +111,27 @@ def run_tests(page, base_url):
     """Run all tests against the loaded page."""
 
     # --------------------------------------------------------
-    # Setup: navigate and wait for module init
+    # Setup: stub, then navigate and wait for module init
     # --------------------------------------------------------
+    # The unit suite must not depend on mempool.space being responsive: a
+    # rate-limited tip fetch at load left the height unknown and the (correct)
+    # lock-time validation blocked PSBT creation in later sections. Serve a
+    # fixed chain tip for every request -- installed BEFORE goto so the
+    # load-time fetch cannot race it. Tests that exercise the fetch itself
+    # add their own route on top (LIFO) and restore this one on unroute.
+    page.route("**/blocks/tip/height",
+               lambda route, req: route.fulfill(status=200, content_type="text/plain", body="900000"))
+    # Same reasoning for the other live endpoints the page touches: raw-tx
+    # lookups (all fake txids in this suite -- 404 matches expectations) and
+    # fee rates (fixed values; no test asserts live labels).
+    page.route("**/api/tx/*/hex", lambda route, req: route.fulfill(status=404, body="Transaction not found"))
+    page.route("**/v1/fees/recommended", lambda route, req: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"fastestFee":3,"halfHourFee":2,"hourFee":1,"economyFee":1,"minimumFee":1}'))
     page.goto(base_url)
     page.wait_for_function("() => window._fn !== undefined", timeout=15000)
+    # Settle one stubbed fetch so tipHeight is deterministic from here on.
+    page.evaluate("() => window._fn.fetchTipHeight()")
 
     # Global dialog handler — auto-accepts all dialogs, records messages
     _all_dialogs = []
@@ -2157,6 +2174,33 @@ def run_tests(page, base_url):
     # None mode
     r = page.evaluate("""() => { window._fn.setLocktimeMode('none'); return window._fn.validateLocktime(); }""")
     test("locktime none: value 0", r.get("value") == 0)
+
+    # Tip fetch survives one failed attempt (retry), and a dead endpoint -> null
+    calls = {"n": 0}
+    def tip_route(route, request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            route.fulfill(status=500, body="err")
+        else:
+            route.fulfill(status=200, content_type="text/plain", body="900123")
+    page.route("**/blocks/tip/height", tip_route)
+    r = page.evaluate("() => window._fn.fetchTipHeight()")
+    test("fetchTipHeight: retries once and succeeds", r == 900123, f"got {r} after {calls['n']} calls")
+    test("fetchTipHeight: exactly two attempts used", calls["n"] == 2, f"{calls['n']}")
+    # restore auto-tracking (earlier manual-edit tests disabled it) so the
+    # field-retention behaviour below is actually exercised
+    page.evaluate("() => window._fn.resetLocktime()")
+    page.wait_for_function("() => document.getElementById('locktimeBlock').value === '900123'", timeout=5000)  # success route still active
+    page.unroute("**/blocks/tip/height")
+    page.route("**/blocks/tip/height", lambda route, req: route.fulfill(status=500, body="err"))
+    r = page.evaluate("() => window._fn.fetchTipHeight()")
+    test("fetchTipHeight: failure keeps the last known height", r == 900123, f"got {r}")
+    test("fetchTipHeight: failure keeps the field filled",
+         page.evaluate("() => document.getElementById('locktimeBlock').value") == "900123")
+    r = page.evaluate("() => { window._fn.tipHeight = null; return window._fn.fetchTipHeight(); }")
+    test("fetchTipHeight: never-known + failure -> null", r is None, f"got {r}")
+    page.unroute("**/blocks/tip/height")
+    page.evaluate("() => window._fn.fetchTipHeight()")
 
     # createPsbtFromInputs honours the parameter (default 0)
     r = page.evaluate("""() => {
