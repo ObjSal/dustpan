@@ -1,6 +1,8 @@
-# Bitcoin Address Sweeper
+# 🧹 Dustpan
 
-Sweep Bitcoin addresses across hardware wallets, hot wallets, and paper wallets into a single transaction using PSBTs ([BIP 174](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki)).
+*Formerly Bitcoin Address Sweeper.*
+
+Dustpan — sweep Bitcoin from addresses, hardware wallets, and paper wallets into a single transaction (PSBT). Built on PSBTs ([BIP 174](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki)).
 
 **[Live Demo](https://objsal.github.io/join-psbts/)**
 

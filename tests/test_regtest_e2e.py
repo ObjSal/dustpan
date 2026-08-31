@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end regtest test for Bitcoin Address Sweeper.
+End-to-end regtest test for Dustpan (formerly Bitcoin Address Sweeper).
 
 Creates an isolated bitcoind regtest instance via server/server.py,
 funds two wallets, builds a multi-input PSBT through the web UI,

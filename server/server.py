@@ -1,5 +1,5 @@
 """
-Local development server for Bitcoin Address Sweeper.
+Local development server for Dustpan (formerly Bitcoin Address Sweeper).
 
 Serves the HTML frontend and provides mempool.space-compatible API endpoints
 backed by a local Bitcoin Core regtest node. When running without --regtest,
@@ -483,7 +483,7 @@ def run_server(port=8000, regtest=False):
         print()
 
     server = ReusableTCPServer(("0.0.0.0", port), PsbtServerHandler)
-    print(f"Address Sweeper Server running on http://localhost:{port}")
+    print(f"Dustpan Server running on http://localhost:{port}")
     if regtest:
         print(f"  Mode: REGTEST (test coins, no real value)")
     print("\nPress Ctrl+C to stop")

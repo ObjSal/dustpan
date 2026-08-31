@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end testnet4 test for Bitcoin Address Sweeper.
+End-to-end testnet4 test for Dustpan (formerly Bitcoin Address Sweeper).
 
 Tests the full multi-wallet PSBT workflow on Bitcoin Testnet4 via mempool.space:
 
@@ -282,7 +282,7 @@ def sign_psbt_in_browser(page, psbt_base64, wif):
 # ============================================================
 
 def setup_page(page, base_url):
-    """Navigate to the Address Sweeper, wait for test hooks, set network to testnet."""
+    """Navigate to Dustpan, wait for test hooks, set network to testnet."""
     page.goto(base_url)
     page.wait_for_function("() => window._fn !== undefined", timeout=15000)
     page.select_option("#network", "testnet")
@@ -369,7 +369,7 @@ def recover_funds():
     wallets = data["wallets"]
 
     print("=" * 60)
-    print("Address Sweeper — Testnet4 RECOVERY MODE")
+    print("Dustpan — Testnet4 RECOVERY MODE")
     print(f"  Returning funds to: {main_address[:20]}...{main_address[-8:]}")
     print("=" * 60)
 
@@ -813,7 +813,7 @@ def run_tests(page, base_url, main_wif, main_address):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Testnet4 E2E test for Bitcoin Address Sweeper")
+        description="Testnet4 E2E test for Dustpan")
     parser.add_argument("--wif",
                         default=os.environ.get("TESTNET4_WIF"),
                         help="WIF for the pre-funded testnet4 address")
@@ -865,7 +865,7 @@ def main():
     preflight_balance_check(main_address)
 
     print("=" * 60)
-    print("Bitcoin Address Sweeper — Testnet4 E2E Test")
+    print("Dustpan — Testnet4 E2E Test")
     print(f"  Main wallet: {main_address[:20]}...{main_address[-8:]}")
     print(f"  Mode: {'headed' if args.headed else 'headless'}")
     print("=" * 60)

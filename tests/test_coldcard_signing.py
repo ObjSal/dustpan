@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Coldcard MK4 signing tests for Bitcoin Address Sweeper.
+Coldcard MK4 signing tests for Dustpan (formerly Bitcoin Address Sweeper).
 
 Tests PSBT signing behavior with a physical Coldcard MK4 connected via USB,
 using the ckcc-protocol CLI tool. Validates signing behavior for:
