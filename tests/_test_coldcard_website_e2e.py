@@ -43,9 +43,19 @@ def find_free_port():
         return s.getsockname()[1]
 
 
+class QuietDisconnectHTTPServer(http.server.HTTPServer):
+    """A browser dropping a connection mid-transfer is routine; the default
+    handle_error traceback trips run_all.py's aborted-run scan."""
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def start_http_server(port):
     handler = http.server.SimpleHTTPRequestHandler
-    httpd = http.server.HTTPServer(("127.0.0.1", port), handler)
+    httpd = QuietDisconnectHTTPServer(("127.0.0.1", port), handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     return httpd

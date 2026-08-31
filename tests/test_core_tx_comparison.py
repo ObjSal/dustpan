@@ -120,7 +120,16 @@ def start_http_server(port):
         def log_message(self, *a):
             pass
 
-    httpd = http.server.HTTPServer(("127.0.0.1", port), Quiet)
+    class QuietServer(http.server.HTTPServer):
+        # A browser dropping a connection mid-transfer is routine; the default
+        # handle_error traceback trips run_all.py's aborted-run scan.
+        def handle_error(self, request, client_address):
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                return
+            super().handle_error(request, client_address)
+
+    httpd = QuietServer(("127.0.0.1", port), Quiet)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
