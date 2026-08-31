@@ -125,10 +125,10 @@ ALLOWLIST: list[dict[str, str]] = [
     {
         "label": "http(s):// URL",
         "match": (
-            'const s = e.getOptions(a), h3 = n.modules.size, u = n.modules.data, d = h3 + '
+            'const s = e.getOptions(a), h4 = n.modules.size, u = n.modules.data, d = h4 + '
             's.margin * 2, g = s.color.light.a ? "<path " + r(s.color.light, "fill") + \' '
             'd="M0 0h\' + d + "v" + d + \'H0z"/>\' : "", v = "<path " + r(s.color.dark, '
-            '"stroke") + \' d="\' + i2(u, h3, s.margin) + \'"/>\', c = \'viewBox="0 0 \' + d '
+            '"stroke") + \' d="\' + i2(u, h4, s.margin) + \'"/>\', c = \'viewBox="0 0 \' + d '
             '+ " " + d + \'"\', S = \'<svg xmlns="http://www.w3.org/2000/svg" \' + (s.width ? '
             '\'width="\' + s.width + \'" height="\' + s.width + \'" \' : "") + c + \' '
             'shape-rendering="crispEdges">\' + g + v + `</svg>'
@@ -138,54 +138,10 @@ ALLOWLIST: list[dict[str, str]] = [
             "calls splitQRs/joinQRs -- bbqr's render()/SVG path is unused dead code that "
             "esbuild's tree-shaking did not eliminate (it shares a module scope with the "
             "exports we do use). An xmlns value is never fetched or navigated to by a browser; "
-            "it is purely a namespace identifier string."
-        ),
-    },
-    {
-        "label": "localStorage",
-        "match": "if (!global.localStorage) return false;",
-        "justification": (
-            "util-deprecate (pulled transitively via bip32@4.0.0 -> wif@2.0.6 -> "
-            "bs58check@2.1.2 -> create-hash -> md5.js -> hash-base -> readable-stream@2) reads "
-            "a noDeprecation/throwDeprecation/traceDeprecation debug flag, guarded by "
-            "try/catch, from inside the wrapper deprecate() returns -- which only runs if a "
-            "deprecated readable-stream API is actually called. This app never calls one. "
-            "Read-only; nothing is written or exfiltrated."
-        ),
-    },
-    {
-        "label": "localStorage",
-        "match": "var val = global.localStorage[name];",
-        "justification": "Same util-deprecate config() read as the entry above.",
-    },
-    {
-        "label": "bare Function(",
-        "match": (
-            'bound = Function("binder", "return function (" + joiny(boundArgs, ",") + '
-            '"){ return binder.apply(this,arguments); }")(binder);'
-        ),
-        "justification": (
-            "function-bind's polyfill path for Function.prototype.bind (used only on engines "
-            "missing native .bind, i.e. never in a modern browser -- see 'Function.prototype."
-            "bind || implementation' at its call site). Builds a wrapper function whose body is "
-            "a fixed, hardcoded string ('return function (...){ return binder.apply(...) }') "
-            "with only a comma-joined list of the bound function's OWN formal-parameter names "
-            "spliced in -- never the value of any argument or any external/attacker-influenced "
-            "data. Pulled transitively via get-intrinsic (see the next entry)."
-        ),
-    },
-    {
-        "label": "bare Function(",
-        "match": '''return $Function('"use strict"; return (' + expressionSyntax + ").constructor;")();''',
-        "justification": (
-            "get-intrinsic's (pulled transitively via bip32 -> ... -> es-abstract-family "
-            "packages) fallback for grabbing the intrinsic %Function% constructor on engines "
-            "where it isn't otherwise reachable, gated behind 'typeof Function ... ? ... : "
-            "$Function(...)' at its call site -- it only runs when the real Function global is "
-            "already unavailable/restricted, and even then the constructed function body is a "
-            "fixed string template ('\"use strict\"; return (<intrinsic-name>).constructor;') "
-            "built from get-intrinsic's OWN internal intrinsic-name table, never from any "
-            "external or attacker-influenced input."
+            "it is purely a namespace identifier string. (The local variable name here is "
+            "esbuild's own scope-hoisting rename, e.g. h3->h4 across the bip32@4->5.0.1 bump "
+            "which removed unrelated modules earlier in the bundle -- update this match's "
+            "counter suffix, not the justification, if a future bump shifts it again.)"
         ),
     },
 ]

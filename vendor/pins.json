@@ -1,6 +1,5 @@
 {
   "_comment": "Source of truth for the vendored dependency bundle (vendor/deps.js, vendor/jsqr.js). Every entry's `integrity` was computed locally (sha512 of the downloaded tarball bytes) at pin time AND cross-checked against the npm registry packument's `dist.integrity` field for that exact version -- see vendor/MANIFEST for the pin date. Do not hand-edit a version or hash; use `python3 tools/vendor-deps.py --bump <pkg>@<version>`.",
-
   "packages": {
     "buffer": {
       "version": "6.0.3",
@@ -33,10 +32,10 @@
       "used_as": "ecc (whole namespace, asm.js build -- deliberately NOT tiny-secp256k1, which ships WASM)"
     },
     "bip32": {
-      "version": "4.0.0",
-      "tarball": "https://registry.npmjs.org/bip32/-/bip32-4.0.0.tgz",
-      "integrity": "sha512-aOGy88DDlVUhspIXJN+dVEtclhIsfAUppD43V0j40cPTld3pv/0X/MlrZSZ6jowIaQQzFwP8M6rFU2z2mVYjDQ==",
-      "used_as": "BIP32Factory (named import -- see vendor/entry.mjs comment on why not `import Foo from`)"
+      "version": "5.0.1",
+      "tarball": "https://registry.npmjs.org/bip32/-/bip32-5.0.1.tgz",
+      "integrity": "sha512-PWlHIAgYCfVhwqNpZyeakHXuLAGyN6rEQZnhxHxKI3BoFJRVWLl26455fhRlHsmbYcV986HqtPnt33Edu5sTCw==",
+      "used_as": "BIP32Factory (named import; real ESM as of v5 -- see vendor/entry.mjs comment). Bumped from 4.0.0 in the 2026-08-31 supply-chain review to drop the legacy wif@2/bs58check@2/create-hash/readable-stream@2 chain and the ljharb cluster it dragged in (~46 of ~83 bundled install paths) for a toWIF()/fromWIF() surface this app never calls."
     },
     "bs58check": {
       "version": "3.0.1",
@@ -51,23 +50,9 @@
       "used_as": "ECPairFactory (named export)"
     }
   },
-
   "shims": {
-    "_comment": "Not imported by our own entry.mjs. bip32@4.0.0 -> wif@2.0.6 -> bs58check@2.1.2 -> create-hash -> md5.js -> hash-base -> readable-stream@2 needs the node core modules 'stream' and 'events', which esbuild --platform=browser will not auto-polyfill. Pinned and hash-verified the same way as the direct imports since their code ends up in the shipped bundle.",
-    "events": {
-      "version": "3.3.0",
-      "tarball": "https://registry.npmjs.org/events/-/events-3.3.0.tgz",
-      "integrity": "sha512-mQw+2fkQbALzQ7V0MY0IqdnXNOeTtP4r0lN9z7AAawCXgqea7bDii20AYrIBrFd/Hx0M2Ocz6S111CaFkUcb0Q==",
-      "aliases": "events"
-    },
-    "stream-browserify": {
-      "version": "3.0.0",
-      "tarball": "https://registry.npmjs.org/stream-browserify/-/stream-browserify-3.0.0.tgz",
-      "integrity": "sha512-H73RAHsVBapbim0tU2JwwOiXUj+fikfiaoYAKHF3VJfA0pe2BCzkhAHBlLG6REzE+2WNZcxOXjK7lkso+9euLA==",
-      "aliases": "stream"
-    }
+    "_comment": "Empty as of the 2026-08-31 bip32@4.0.0 -> 5.0.1 bump. Historical note: bip32@4.0.0 -> wif@2.0.6 -> bs58check@2.1.2 -> create-hash -> md5.js -> hash-base -> readable-stream@2 needed the node core modules 'stream' and 'events' node-builtin-shimmed in (events@3.3.0, stream-browserify@3.0.0), which esbuild --platform=browser does not auto-polyfill. bip32@5.0.1's dependency tree (wif@5, @scure/base, @noble/hashes, valibot, uint8array-tools) needs no node builtins, so both shims and their esbuild --alias flags were removed. If a future pin ever needs a node-builtin shim again, pin and hash-verify it the same way these were (see tools/vendor-deps.py's iter_pinned/ESBUILD_ALIAS_FLAGS)."
   },
-
   "esbuild": {
     "version": "0.28.2",
     "tarball": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",

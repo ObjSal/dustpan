@@ -189,7 +189,7 @@ assert(Buffer.from(joined.raw).equals(dummyPsbt), 'joinQRs(splitQRs(x).parts).ra
 
 assert(typeof jsQR === 'function', 'jsQR (bundled) is a function');
 
-assert(!!VERSIONS && VERSIONS['bitcoinjs-lib'] === '7.0.1' && VERSIONS['bip32'] === '4.0.0',
+assert(!!VERSIONS && VERSIONS['bitcoinjs-lib'] === '7.0.1' && VERSIONS['bip32'] === '5.0.1',
   'VERSIONS carries the pinned package versions from pins.json');
 
 // --- Part 2: vendor/jsqr.js as a standalone <script> --------------------------------------

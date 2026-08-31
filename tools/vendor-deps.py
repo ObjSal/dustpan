@@ -19,43 +19,57 @@ WHY THIS EXISTS
 
 TWO-TRACK PROVENANCE
     Track A (this script, stdlib only): downloads the exact tarball for each of the 8 imported
-    packages + the 2 node-builtin shims (see SHIMS below) + esbuild itself, computes sha512 over
-    the raw bytes, and hard-fails on any mismatch against vendor/pins.json. This is the security
-    gate; it runs before npm is ever invoked, on every build and every --verify.
+    packages (no node-builtin shims as of the 2026-08-31 bip32@5.0.1 bump -- see NODE BUILTIN
+    SHIMS below) + esbuild itself, computes sha512 over the raw bytes, and hard-fails on any
+    mismatch against vendor/pins.json. This is the security gate; it runs before npm is ever
+    invoked, on every build and every --verify.
     Track B (npm, invoked via subprocess): resolves and installs the *transitive* dependency
-    tree (bech32, valibot, @noble/hashes, wif, typeforce, @scure/base, bs58, create-hash, ...)
-    that esbuild needs to actually compile the bundle. npm's own fetcher independently verifies
-    every package's integrity against npm registry metadata as a normal, non-optional part of
+    tree (bech32, valibot, @noble/hashes, wif, @scure/base, bs58, bip174, ...) that esbuild needs
+    to actually compile the bundle. npm's own fetcher independently verifies every package's
+    integrity against npm registry metadata as a normal, non-optional part of
     `npm install`/`npm ci` -- this is not something this script can disable. The exact resolved
     tree is committed at vendor/package-lock.json (regenerated only in `build`/`--bump`, never
     silently rewritten by `--verify`) so a rebuild years from now resolves identically.
-    Track A alone covers the 11 packages explicitly named in pins.json (the ones whose code was
+    Track A alone covers the 9 packages explicitly named in pins.json (the ones whose code was
     chosen and reviewed by name); Track B is deliberately not given the same one-by-one manual
-    review -- pinning ~80 transitive packages individually was judged not worth the maintenance
-    burden versus what npm's own integrity checking + a committed lockfile already provide. If
-    that trade-off ever needs revisiting, vendor/package-lock.json is the audit trail.
+    review -- pinning the ~15 remaining transitive packages individually was judged not worth the
+    maintenance burden versus what npm's own integrity checking + a committed lockfile already
+    provide (this was ~80 transitive packages before the 2026-08-31 bip32@4.0.0 -> 5.0.1 bump
+    dropped the legacy wif@2/bs58check@2/create-hash/readable-stream@2 chain and the ljharb
+    cluster it dragged in). If that trade-off ever needs revisiting, vendor/package-lock.json is
+    the audit trail.
 
-NODE BUILTIN SHIMS (documented per the "document any shim" rule)
+NODE BUILTIN SHIMS -- REMOVED 2026-08-31, historical note (pins.json "shims" is now empty)
     bip32@4.0.0 -> wif@2.0.6 -> bs58check@2.1.2 -> create-hash -> md5.js -> hash-base ->
-    readable-stream@2 needs the node core modules "stream" and "events". esbuild's
-    --platform=browser does NOT auto-polyfill these (that's a --platform=node-only behavior),
-    so the build fails with "Could not resolve stream/events -- built into node" unless something
-    resolvable is installed under those exact bare specifiers. Two small, well-known, actively
-    maintained pure-JS packages are pinned for this purpose (see pins.json "shims"): `events`
-    (Node's own EventEmitter, backported/republished standalone) and `stream-browserify`
-    (browserify's Readable/Writable/Transform polyfill). They are wired in only via esbuild's
+    readable-stream@2 needed the node core modules "stream" and "events". esbuild's
+    --platform=browser does NOT auto-polyfill these (that's a --platform=node-only behavior), so
+    the build failed with "Could not resolve stream/events -- built into node" unless something
+    resolvable was installed under those exact bare specifiers. Two small, well-known, actively
+    maintained pure-JS packages were pinned for this purpose: `events` (Node's own EventEmitter,
+    backported/republished standalone) and `stream-browserify` (browserify's
+    Readable/Writable/Transform polyfill), wired in only via esbuild's
     `--alias:stream=stream-browserify --alias:events=events` flags -- vendor/entry.mjs never
-    imports them directly, and window.__vendor never exposes them.
+    imported them directly, and window.__vendor never exposed them. The 2026-08-31 bip32@4.0.0 ->
+    5.0.1 bump replaced that whole legacy chain (wif@5, @scure/base, @noble/hashes, valibot,
+    uint8array-tools -- all already in the bundle via ecpair@3/bitcoinjs-lib@7) with a tree that
+    needs no node builtins, so both shims and the ESBUILD_ALIAS_FLAGS that wired them in were
+    removed. If a future pin ever needs a node-builtin shim again, pin and hash-verify it the
+    same way (see iter_pinned()'s "shim" category and pins.json's "shims" object) rather than
+    reaching for esbuild's --inject or a bare unpinned polyfill.
 
-BIP32 DEFAULT-IMPORT INTEROP NOTE
-    bip32@4.0.0's CJS module sets `exports.default = exports.BIP32Factory = <fn>`. Real ESM/CJS
+BIP32 DEFAULT-IMPORT INTEROP NOTE -- historical, applied to bip32@4.0.0 only
+    bip32@4.0.0's CJS module set `exports.default = exports.BIP32Factory = <fn>`. Real ESM/CJS
     interop (both Node's own and esbuild's, which replicates it) binds a *default* import to the
     whole `module.exports` object, not to `module.exports.default` -- that unwrap-to-.default
     convention is a TypeScript/webpack/babel-only convention, not part of the JS spec or Node's
-    behavior. So `import BIP32Factory from 'bip32'` would bind BIP32Factory to
-    `{ default: fn, BIP32Factory: fn }`, not to the callable itself. vendor/entry.mjs uses the
-    *named* import `import { BIP32Factory } from 'bip32'` instead, which resolves correctly.
-    (Verified: window.__vendor.BIP32Factory is a function that npm's bip32@4.0.0 says it is.)
+    behavior. So `import BIP32Factory from 'bip32'` would have bound BIP32Factory to
+    `{ default: fn, BIP32Factory: fn }`, not to the callable itself, and vendor/entry.mjs used the
+    *named* import `import { BIP32Factory } from 'bip32'` instead, which resolved correctly.
+    bip32@5.0.1 (the 2026-08-31 bump) ships real ESM (`"type": "module"`) whose index re-exports
+    `BIP32Factory` as BOTH the default AND a named export (`export { BIP32Factory as default,
+    BIP32Factory }`), so this interop hazard no longer exists -- either import form now resolves
+    to the same callable. vendor/entry.mjs keeps the named-import spelling for consistency with
+    the ECPairFactory import beside it, not because it is still required.
 
 JSQR VENDORING CHOICE (recorded per the task's "record which in MANIFEST" instruction)
     vendor/jsqr.js is NOT esbuild output. jsqr@1.4.0 ships a self-contained webpack UMD build at
@@ -89,7 +103,7 @@ Modes
                             committed vendor/pins.json + vendor/package-lock.json -- i.e. that
                             nobody hand-edited deps.js/jsqr.js after the fact, or bumped a pin
                             without rebuilding. It does NOT prove the lockfile itself is honest:
-                            Track A only re-hashes the 11 packages named in pins.json, and Track B
+                            Track A only re-hashes the 9 packages named in pins.json, and Track B
                             (npm resolving vendor/package-lock.json) reproduces byte-identically
                             from a *poisoned* committed lockfile too, since npm is just replaying
                             exactly what that file says to fetch. The actual defence against a
@@ -146,7 +160,6 @@ USER_AGENT = "join-psbts-vendor-deps/1.0 (+tools/vendor-deps.py)"
 REGISTRY = "https://registry.npmjs.org"
 
 ESBUILD_BUNDLE_FLAGS = ["--bundle", "--format=iife", "--platform=browser", "--target=es2022"]
-ESBUILD_ALIAS_FLAGS = ["--alias:stream=stream-browserify", "--alias:events=events"]
 
 
 # --------------------------------------------------------------------------------------
@@ -265,7 +278,8 @@ def save_pins(pins: dict) -> None:
 
 def iter_pinned(pins: dict):
     """Yields (name, info, category) for every entry that gets a Track-A hash check:
-    the 8 direct imports, the 2 node-builtin shims, and esbuild itself."""
+    the 8 direct imports, any node-builtin shims (none as of the 2026-08-31 bip32@5.0.1
+    bump -- see pins.json "shims"), and esbuild itself."""
     for name, info in pins["packages"].items():
         yield name, info, "package"
     for name, info in pins["shims"].items():
@@ -459,15 +473,14 @@ def render_entry_mjs(pins: dict) -> str:
 //
 // Replaces index.html's pinned esm.sh/jsdelivr CDN imports with a single local, auditable
 // bundle (vendor/deps.js). See tools/vendor-deps.py's module docstring for the full design
-// rationale (two-track provenance, node-builtin shims, the bip32 default-import interop note).
+// rationale (two-track provenance, the historical node-builtin-shims and bip32 default-import
+// interop notes -- both moot as of the bip32@5.0.1 bump, kept there for context).
 import {{ Buffer }} from 'buffer';
 import {{ initEccLib, address, networks, payments, crypto, Transaction, Psbt }} from 'bitcoinjs-lib';
 import * as ecc from '@bitcoin-js/tiny-secp256k1-asmjs';
-// bip32's CJS module sets exports.default = exports.BIP32Factory = <fn>. Real ESM/CJS interop
-// binds a *default* import to the whole module.exports object, not to module.exports.default
-// (that unwrap-to-.default convention is a bundler/TS convention, not the JS spec), so a default
-// import here would bind BIP32Factory to {{ default, BIP32Factory }} instead of the function
-// itself. The named import resolves to the actual callable.
+// bip32 is real ESM (`"type": "module"`) whose index re-exports BIP32Factory as both the
+// default and a named export, so either import form resolves to the same callable; the named
+// form is used here for consistency with the ECPairFactory import below.
 import {{ BIP32Factory }} from 'bip32';
 import {{ ECPairFactory }} from 'ecpair';
 import bs58check from 'bs58check';
@@ -521,7 +534,7 @@ def run_build_pipeline(pins: dict, downloaded: dict[str, bytes], allow_relock: b
         log("== Bundling vendor/deps.js with esbuild (no minification) ==")
         out_deps = build_dir / "deps.js"
         run(
-            [str(esbuild_bin), "entry.mjs", *ESBUILD_BUNDLE_FLAGS, *ESBUILD_ALIAS_FLAGS,
+            [str(esbuild_bin), "entry.mjs", *ESBUILD_BUNDLE_FLAGS,
              f"--outfile={out_deps.name}"],
             cwd=build_dir,
         )
@@ -565,17 +578,21 @@ def write_manifest(pins: dict, result: BuildResult) -> None:
         lines.append(f"  {name}@{info['version']}")
         lines.append(f"    tarball:   {info['tarball']}")
         lines.append(f"    sha512:    {info['integrity']}")
+    shim_entries = [(n, i) for n, i in pins["shims"].items() if not n.startswith("_")]
     lines.append("")
-    lines.append("Node-builtin shims (not imported by entry.mjs; wired via esbuild --alias, see")
-    lines.append("tools/vendor-deps.py module docstring for why bip32@4.0.0 needs them)")
-    lines.append("-" * 88)
-    for name, info in pins["shims"].items():
-        if name.startswith("_"):
-            continue
-        lines.append(f"  {name}@{info['version']}  (alias target for: {info['aliases']})")
-        lines.append(f"    tarball:   {info['tarball']}")
-        lines.append(f"    sha512:    {info['integrity']}")
-    lines.append("")
+    if shim_entries:
+        lines.append("Node-builtin shims (not imported by entry.mjs; wired via esbuild --alias, see")
+        lines.append("tools/vendor-deps.py module docstring for why they are needed)")
+        lines.append("-" * 88)
+        for name, info in shim_entries:
+            lines.append(f"  {name}@{info['version']}  (alias target for: {info['aliases']})")
+            lines.append(f"    tarball:   {info['tarball']}")
+            lines.append(f"    sha512:    {info['integrity']}")
+        lines.append("")
+    else:
+        lines.append("Node-builtin shims: none (see tools/vendor-deps.py module docstring's")
+        lines.append("NODE BUILTIN SHIMS section for the historical bip32@4.0.0-era need).")
+        lines.append("")
     lines.append("Build tool")
     lines.append("-" * 88)
     lines.append(f"  esbuild@{pins['esbuild']['version']}")
@@ -689,7 +706,7 @@ def cmd_verify() -> None:
         "vendor/pins.json + vendor/package-lock.json, pass the supply-chain audit, and pass "
         "the crypto smoke test.")
     log("This proves lock<->bundle CONSISTENCY, not lockfile integrity: it re-hashes only the "
-        "11 packages named in pins.json against the registry. A committed package-lock.json "
+        "9 packages named in pins.json against the registry. A committed package-lock.json "
         "that already names a poisoned transitive package reproduces this same byte-identical "
         "PASS, because npm just replays what that file says to fetch. The defence against that "
         "is human review of vendor/package-lock.json's diff on every change, not this command.")
@@ -842,7 +859,7 @@ def cmd_bump(spec: str) -> None:
         f"reason to stop and investigate, not to proceed.")
     log("Remember: the dist.integrity cross-check earlier in this run is a self-check "
         "(transport corruption only), and none of Track A/Track B/this bump independently "
-        "re-reviews the ~80 transitive packages -- steps 1-2 above are the actual review.")
+        "re-reviews the unpinned transitive package tree -- steps 1-2 above are the actual review.")
 
 
 # --------------------------------------------------------------------------------------

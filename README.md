@@ -153,7 +153,7 @@ python3 tools/sign-psbt.py unsigned.psbt <WIF-private-key>
 ## Tech Stack
 
 - **Frontend**: `index.html` (sweeper) + `donate.html`, no build step
-- **JS Libraries** (vendored locally into `vendor/deps.js`/`vendor/jsqr.js`, built from hash-pinned npm tarballs — see `vendor/pins.json`): [bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) v7.0.1, [bip32](https://github.com/bitcoinjs/bip32) v4.0.0, [bs58check](https://github.com/bitcoinjs/bs58check) v3.0.1, [ecpair](https://github.com/bitcoinjs/ecpair) v3.0.0, [bbqr](https://github.com/coinkite/BBQr), [jsQR](https://github.com/cozmo/jsQR)
+- **JS Libraries** (vendored locally into `vendor/deps.js`/`vendor/jsqr.js`, built from hash-pinned npm tarballs — see `vendor/pins.json`): [bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) v7.0.1, [bip32](https://github.com/bitcoinjs/bip32) v5.0.1, [bs58check](https://github.com/bitcoinjs/bs58check) v3.0.1, [ecpair](https://github.com/bitcoinjs/ecpair) v3.0.0, [bbqr](https://github.com/coinkite/BBQr), [jsQR](https://github.com/cozmo/jsQR)
 - **QR Generator**: Custom `qr_generator.js` (shared with [bitcoin-gift-paper-wallet](https://github.com/ObjSal/bitcoin-gift-paper-wallet))
 - **Dev Server**: Python stdlib (`http.server`) + Bitcoin Core RPC
 - **Tests**: [Playwright](https://playwright.dev/python/) (Python sync API)

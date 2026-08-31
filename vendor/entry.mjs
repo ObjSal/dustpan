@@ -3,15 +3,14 @@
 //
 // Replaces index.html's pinned esm.sh/jsdelivr CDN imports with a single local, auditable
 // bundle (vendor/deps.js). See tools/vendor-deps.py's module docstring for the full design
-// rationale (two-track provenance, node-builtin shims, the bip32 default-import interop note).
+// rationale (two-track provenance, the historical node-builtin-shims and bip32 default-import
+// interop notes -- both moot as of the bip32@5.0.1 bump, kept there for context).
 import { Buffer } from 'buffer';
 import { initEccLib, address, networks, payments, crypto, Transaction, Psbt } from 'bitcoinjs-lib';
 import * as ecc from '@bitcoin-js/tiny-secp256k1-asmjs';
-// bip32's CJS module sets exports.default = exports.BIP32Factory = <fn>. Real ESM/CJS interop
-// binds a *default* import to the whole module.exports object, not to module.exports.default
-// (that unwrap-to-.default convention is a bundler/TS convention, not the JS spec), so a default
-// import here would bind BIP32Factory to { default, BIP32Factory } instead of the function
-// itself. The named import resolves to the actual callable.
+// bip32 is real ESM (`"type": "module"`) whose index re-exports BIP32Factory as both the
+// default and a named export, so either import form resolves to the same callable; the named
+// form is used here for consistency with the ECPairFactory import below.
 import { BIP32Factory } from 'bip32';
 import { ECPairFactory } from 'ecpair';
 import bs58check from 'bs58check';
@@ -34,7 +33,7 @@ window.__vendor = Object.freeze({
     "bbqr": "1.2.0",
     "jsqr": "1.4.0",
     "@bitcoin-js/tiny-secp256k1-asmjs": "2.2.3",
-    "bip32": "4.0.0",
+    "bip32": "5.0.1",
     "bs58check": "3.0.1",
     "ecpair": "3.0.0"
   }),

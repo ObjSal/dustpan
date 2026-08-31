@@ -6,14 +6,12 @@
   "dependencies": {
     "@bitcoin-js/tiny-secp256k1-asmjs": "2.2.3",
     "bbqr": "1.2.0",
-    "bip32": "4.0.0",
+    "bip32": "5.0.1",
     "bitcoinjs-lib": "7.0.1",
     "bs58check": "3.0.1",
     "buffer": "6.0.3",
     "ecpair": "3.0.0",
     "esbuild": "0.28.2",
-    "events": "3.3.0",
-    "jsqr": "1.4.0",
-    "stream-browserify": "3.0.0"
+    "jsqr": "1.4.0"
   }
 }
