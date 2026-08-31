@@ -404,6 +404,47 @@
   </div>
 </div><!-- /.container -->
 
+  <!-- HD wallet import dialog -->
+  <div id="hdImportOverlay" style="display:none; position:fixed; inset:0; background:rgba(8,12,20,0.72); z-index:50; align-items:center; justify-content:center; padding:16px;">
+    <div id="hdImportDialog" style="width:min(560px, 100%); max-height:86vh; display:flex; flex-direction:column; background:#161d2b; border:1px solid rgba(255,255,255,0.14); border-radius:12px; box-shadow:0 18px 60px rgba(0,0,0,0.5);">
+      <div style="display:flex; align-items:baseline; gap:0.6rem; padding:1rem 1.2rem 0.6rem;">
+        <h3 style="margin:0;">Import HD Wallet</h3>
+        <span id="hdImportXpubShort" style="color:var(--text-secondary); font-family:'Courier New',monospace; font-size:0.78rem;"></span>
+        <button type="button" id="hdImportClose" class="remove" style="margin-left:auto;">✕</button>
+      </div>
+
+      <!-- Step 1: address type -->
+      <div id="hdImportStepType" style="padding:0.4rem 1.2rem 1.2rem;">
+        <p style="color:var(--text-secondary); font-size:0.85rem; margin:0 0 0.8rem;">This key can derive more than one address type. Which does this wallet use?</p>
+        <div id="hdTypeCards" style="display:flex; flex-direction:column; gap:0.6rem;"></div>
+      </div>
+
+      <!-- Step 2: address list -->
+      <div id="hdImportStepList" style="display:none; flex:1; min-height:0;">
+        <div style="display:flex; align-items:center; gap:0.6rem; padding:0.2rem 1.2rem 0.6rem;">
+          <span id="hdTypeBadge" style="font-size:0.75rem; padding:0.15rem 0.5rem; border:1px solid rgba(247,147,26,0.55); border-radius:999px; color:var(--btc-orange);"></span>
+          <div id="hdChainToggle" style="display:flex; border:1px solid rgba(255,255,255,0.18); border-radius:8px; overflow:hidden; margin-left:auto;">
+            <button type="button" data-chain="0" class="hd-chain btn-secondary" style="margin:0; border:0; border-radius:0; padding:0.35rem 0.9rem;">Receive</button>
+            <button type="button" data-chain="1" class="hd-chain btn-secondary" style="margin:0; border:0; border-radius:0; padding:0.35rem 0.9rem;">Change</button>
+          </div>
+        </div>
+        <p style="color:var(--text-secondary); font-size:0.75rem; margin:0; padding:0 1.2rem 0.5rem;">Addresses are derived locally — nothing is looked up until you import. Only the selected addresses are checked on mempool.space.</p>
+        <div style="display:flex; align-items:center; gap:0.5rem; padding:0.3rem 1.2rem; border-top:1px solid rgba(255,255,255,0.08); color:var(--text-secondary); font-size:0.78rem;">
+          <input type="checkbox" id="hdSelectPage" style="width:auto;"> <label for="hdSelectPage" style="cursor:pointer;">Select all shown</label>
+          <span id="hdSelCount" style="margin-left:auto;"></span>
+        </div>
+        <div id="hdAddrList" style="flex:1; overflow-y:auto; min-height:120px; max-height:44vh; border-top:1px solid rgba(255,255,255,0.08);"></div>
+        <div style="padding:0.5rem 1.2rem;">
+          <button type="button" id="hdLoadMore" class="btn-secondary" style="width:100%; margin:0;">Show 20 more</button>
+        </div>
+        <div style="display:flex; gap:0.6rem; align-items:center; padding:0.7rem 1.2rem 1rem; border-top:1px solid rgba(255,255,255,0.1);">
+          <button type="button" id="hdImportCancel" class="btn-secondary" style="width:auto; margin:0;">Cancel</button>
+          <button type="button" id="hdImportGo" class="btn-primary" style="width:auto; margin:0 0 0 auto;">Import 0 addresses</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="qr_generator.js"></script>
   <script type="module">
     // SUPPLY CHAIN: every import below MUST carry an exact version. This page
@@ -905,7 +946,7 @@
       if (!address) { statusEl.textContent = 'Enter an address or extended public key.'; return; }
 
       // Dispatch: xpub scan vs WIF vs single-address fetch
-      if (isExtendedKey(address)) { return fetchUtxosFromXpub(address); }
+      if (isExtendedKey(address)) { return openHdImport(address); }
       if (isWif(address)) { return fetchUtxosFromWif(address); }
 
       if (!validateBitcoinAddress(address, net)) { statusEl.textContent = 'Invalid address for selected network.'; return; }
@@ -964,70 +1005,35 @@
     }
 
     // Scans one chain (0=receive, 1=change) for one address type using gap limit
-    async function scanXpubAddresses(xpubStr, chain, addrType, network, base, onProgress) {
-      const GAP_LIMIT = 20;
-      const BATCH_SIZE = 5;
-      const BATCH_DELAY = 200; // ms between batches (rate limiting)
+    // ---------------- HD wallet import (xpub / ypub / zpub) ----------------
+    // Deriving addresses from an extended key is local and free; only UTXO
+    // lookups cost mempool.space requests. So instead of a blind gap-limit
+    // scan (up to ~80 requests per key, silent stop at index 20, change
+    // addresses buried), pasting an extended key opens a picker: choose the
+    // address type, tick the addresses you own (receive AND change, unlimited
+    // depth), and ONLY those are looked up.
+    const HD_TYPES = {
+      p2wpkh: { label: 'Native SegWit', hint: 'bc1q… · BIP84 · most wallets today', purpose: 84 },
+      p2tr:   { label: 'Taproot',       hint: 'bc1p… · BIP86', purpose: 86 },
+      'p2sh-p2wpkh': { label: 'Nested SegWit', hint: '3… · BIP49 · older wallets', purpose: 49 },
+    };
+    const HD_PAGE = 20;
+    const hd = { xpub: null, node: null, depth: 0, coinType: 0, types: [], type: null,
+                 chain: 0, shown: HD_PAGE, selected: new Set(), busy: false };
 
-      const { key: canonical, isTestnet } = normalizeExtendedKey(xpubStr);
-      const bip32Net = isTestnet ? bitcoin.networks.testnet : bitcoin.networks.bitcoin;
-      const node = bip32.fromBase58(canonical, bip32Net);
-      const chainNode = node.derive(chain);
-
-      const results = [];
-      let consecutiveEmpty = 0;
-      let index = 0;
-
-      while (consecutiveEmpty < GAP_LIMIT) {
-        const batch = [];
-        for (let b = 0; b < BATCH_SIZE; b++) {
-          const child = chainNode.derive(index + b);
-          const pubkey = Buffer.from(child.publicKey);
-          const address = pubkeyToAddress(pubkey, addrType.type, network);
-          batch.push({ address, index: index + b, pubkey });
-        }
-
-        const responses = await Promise.allSettled(
-          batch.map(b =>
-            fetch(`${base}/address/${b.address}/utxo`)
-              .then(r => r.ok ? r.json() : [])
-          )
-        );
-
-        for (let i = 0; i < batch.length; i++) {
-          const utxos = responses[i].status === 'fulfilled' ? responses[i].value : [];
-          if (utxos.length > 0) {
-            consecutiveEmpty = 0;
-            results.push({
-              address: batch[i].address,
-              index: batch[i].index,
-              chain,
-              pubkey: Buffer.from(batch[i].pubkey).toString('hex'),
-              utxos,
-            });
-          } else {
-            consecutiveEmpty++;
-          }
-        }
-        index += BATCH_SIZE;
-
-        if (onProgress) onProgress(index, consecutiveEmpty, results.length);
-
-        if (consecutiveEmpty < GAP_LIMIT) {
-          await new Promise(r => setTimeout(r, BATCH_DELAY));
-        }
-      }
-      return results;
-    }
-
-    // Orchestrates xpub scanning across all address types and chains
-    async function fetchUtxosFromXpub(xpubStr) {
+    function openHdImport(xpubStr) {
       const statusEl = document.getElementById('fetchStatus');
       const net = getSelectedNetwork();
-      const base = getMempoolBaseUrl();
-
-      // Validate xpub network matches selected network
-      const { isTestnet } = normalizeExtendedKey(xpubStr);
+      // A string can look like an extended key (right prefix) and still be
+      // invalid base58check; without this the throw was silent and the user
+      // got no feedback at all.
+      let canonical, isTestnet;
+      try {
+        ({ key: canonical, isTestnet } = normalizeExtendedKey(xpubStr));
+      } catch (e) {
+        statusEl.textContent = 'Invalid extended public key.';
+        return;
+      }
       const isMainnetSelected = (net === bitcoin.networks.bitcoin);
       if (isTestnet && isMainnetSelected) {
         statusEl.textContent = 'Testnet extended key but mainnet selected. Switch network.';
@@ -1037,140 +1043,238 @@
         statusEl.textContent = 'Mainnet extended key but testnet/regtest selected. Switch network.';
         return;
       }
-
-      // Determine address types from original prefix
       const versionHex = getOriginalVersionHex(xpubStr);
       const addressTypes = XPUB_ADDRESS_TYPES.get(versionHex);
       if (!addressTypes) {
         statusEl.textContent = 'Unsupported extended key type.';
         return;
       }
+      const bip32Net = isTestnet ? bitcoin.networks.testnet : bitcoin.networks.bitcoin;
+      hd.xpub = xpubStr;
+      hd.node = bip32.fromBase58(canonical, bip32Net);
+      hd.depth = hd.node.depth;
+      hd.coinType = isTestnet ? 1 : 0;
+      hd.types = addressTypes.map(t => t.type);
+      hd.type = null; hd.chain = 0; hd.shown = HD_PAGE; hd.selected = new Set(); hd.busy = false;
+      statusEl.textContent = '';
+      document.getElementById('hdImportXpubShort').textContent = xpubStr.slice(0, 10) + '…' + xpubStr.slice(-6);
+      document.getElementById('hdImportOverlay').style.display = 'flex';
+      if (hd.types.length === 1) { hdPickType(hd.types[0]); return; }
+      // Ambiguous prefix (xpub/tpub): ask which type this wallet uses, and
+      // show each type's real first address so the user can match it against
+      // what their wallet app displays.
+      document.getElementById('hdImportStepType').style.display = '';
+      document.getElementById('hdImportStepList').style.display = 'none';
+      const cards = document.getElementById('hdTypeCards');
+      cards.innerHTML = '';
+      hd.types.forEach(t => {
+        const meta = HD_TYPES[t];
+        const addr0 = hdDerive(t, 0, 0).address;
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'btn-secondary hd-type-card';
+        b.style.cssText = 'text-align:left; margin:0; padding:0.7rem 0.9rem;';
+        b.innerHTML = `<strong>${meta.label}</strong> <span style="color:var(--text-secondary);font-size:0.8rem;">${meta.hint}</span>` +
+          `<div style="font-family:'Courier New',monospace;font-size:0.75rem;color:var(--text-secondary);margin-top:0.2rem;">first: ${addr0.slice(0, 24)}…</div>`;
+        b.onclick = () => hdPickType(t);
+        cards.appendChild(b);
+      });
+    }
 
-      statusEl.textContent = 'Scanning addresses...';
+    function hdDerive(type, chain, index) {
+      const child = hd.node.derive(chain).derive(index);
+      const pubkey = Buffer.from(child.publicKey);
+      return { address: pubkeyToAddress(pubkey, type, getSelectedNetwork()), pubkey, chain, index };
+    }
 
+    // Best-guess full derivation path for HW wallet key origin (same rule the
+    // old scan used): account-level key (depth 3) -> m/purpose'/coin'/0'/c/i,
+    // anything else -> relative c/i.
+    function hdFullPath(chain, index) {
+      if (hd.depth === 3) return `m/${HD_TYPES[hd.type].purpose}'/${hd.coinType}'/0'/${chain}/${index}`;
+      return `${chain}/${index}`;
+    }
+
+    function hdPickType(t) {
+      hd.type = t;
+      document.getElementById('hdImportStepType').style.display = 'none';
+      const step = document.getElementById('hdImportStepList');
+      step.style.display = 'flex'; step.style.flexDirection = 'column';
+      document.getElementById('hdTypeBadge').textContent = HD_TYPES[t].label;
+      hdRenderList();
+    }
+
+    function hdRenderList() {
+      document.querySelectorAll('.hd-chain').forEach(b => {
+        const active = parseInt(b.dataset.chain) === hd.chain;
+        b.style.background = active ? 'var(--btc-orange)' : '';
+        b.style.color = active ? '#fff' : '';
+      });
+      const list = document.getElementById('hdAddrList');
+      list.innerHTML = '';
+      let allShownSelected = hd.shown > 0;
+      for (let i = 0; i < hd.shown; i++) {
+        const d = hdDerive(hd.type, hd.chain, i);
+        const key = `${hd.chain}/${i}`;
+        if (!hd.selected.has(key)) allShownSelected = false;
+        const row = document.createElement('label');
+        row.className = 'hd-addr-row';
+        row.style.cssText = 'display:flex; align-items:center; gap:0.6rem; padding:0.42rem 1.2rem; cursor:pointer; border-bottom:1px solid rgba(255,255,255,0.05); font-size:0.85rem;';
+        row.innerHTML = `<input type="checkbox" style="width:auto;" ${hd.selected.has(key) ? 'checked' : ''}>` +
+          `<span style="color:var(--text-secondary); font-family:'Courier New',monospace; width:3.2rem; flex:0 0 auto;">${key}</span>` +
+          `<span class="hd-addr" style="font-family:'Courier New',monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${d.address}</span>`;
+        row.querySelector('input').addEventListener('change', (e) => {
+          e.target.checked ? hd.selected.add(key) : hd.selected.delete(key);
+          hdCounts();
+        });
+        list.appendChild(row);
+      }
+      document.getElementById('hdSelectPage').checked = allShownSelected;
+      hdCounts();
+    }
+
+    function hdCounts() {
+      const n = hd.selected.size;
+      document.getElementById('hdSelCount').textContent = n ? `${n} selected` : '';
+      const go = document.getElementById('hdImportGo');
+      if (!hd.busy) {
+        go.textContent = `Import ${n} address${n === 1 ? '' : 'es'}`;
+        go.disabled = n === 0;
+      }
+    }
+
+    function hdCloseDialog() {
+      document.getElementById('hdImportOverlay').style.display = 'none';
+      hd.busy = false;
+    }
+
+    // Factored: one source label per chain group of an import. Stamped with
+    // the xpub so a fingerprint typed into any label mirrors to every label
+    // of the same wallet and the rows under them.
+    function addXpubSourceLabel(xpubStr, groupText, sats, utxoCount) {
+      const btc = (sats / 1e8).toFixed(8).replace(/\.?0+$/, '');
+      const label = document.createElement('div');
+      label.className = 'utxo-source-label';
+      label.setAttribute('data-xpub-source', xpubStr);
+      const shortXpub = xpubStr.slice(0, 8) + '…' + xpubStr.slice(-6);
+      label.innerHTML = `From: ${shortXpub} (${groupText}) ` +
+        `<span style="float:right;color:#f7931a;font-weight:bold;">${btc} BTC (${utxoCount} UTXO${utxoCount !== 1 ? 's' : ''})</span>` +
+        `<div style="margin-top:0.3rem;"><input class="xpub-xfp" placeholder="Master fingerprint (8 hex, e.g. aabbccdd)" ` +
+        `style="width:200px;font-size:0.82rem;padding:0.2rem 0.4rem;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--text-primary);"></div>`;
+      document.getElementById('utxoContainer').appendChild(label);
+      const xfpInput = label.querySelector('.xpub-xfp');
+      xfpInput.addEventListener('input', () => {
+        const val = xfpInput.value.trim();
+        let el = label.nextElementSibling;
+        while (el && !el.classList.contains('utxo-source-label')) {
+          if (el.hasAttribute('data-utxo')) {
+            const hwXfp = el.querySelector('.hw-xfp');
+            if (hwXfp) hwXfp.value = val;
+          }
+          el = el.nextElementSibling;
+        }
+        document.querySelectorAll('.utxo-source-label[data-xpub-source]').forEach(other => {
+          if (other === label) return;
+          if (other.getAttribute('data-xpub-source') !== xpubStr) return;
+          const otherXfp = other.querySelector('.xpub-xfp');
+          if (otherXfp && otherXfp.value !== xfpInput.value) {
+            otherXfp.value = xfpInput.value;
+            otherXfp.dispatchEvent(new Event('input'));
+          }
+        });
+      });
+      return label;
+    }
+
+    // Fetches UTXOs for EXACTLY the selected addresses -- nothing else ever
+    // touches mempool.space. Small batches with a delay for rate limiting.
+    async function importHdAddresses() {
+      if (hd.busy || hd.selected.size === 0) return;
+      const statusEl = document.getElementById('fetchStatus');
+      const net = getSelectedNetwork();
+      const base = getMempoolBaseUrl();
+      const go = document.getElementById('hdImportGo');
+      hd.busy = true; go.disabled = true;
+      const entries = [...hd.selected]
+        .map(k => { const [c, i] = k.split('/').map(Number); return hdDerive(hd.type, c, i); })
+        .sort((a, b) => a.chain - b.chain || a.index - b.index);
       try {
         // Remove empty input rows before adding fetched UTXOs
         document.querySelectorAll('#utxoContainer [data-utxo]').forEach(row => {
           const txid = row.querySelector('input').value.trim();
           if (!txid) row.remove();
         });
-
-        // Parse xpub to get depth for building full derivation paths
-        const { key: canonical } = normalizeExtendedKey(xpubStr);
-        const bip32Net = isTestnet ? bitcoin.networks.testnet : bitcoin.networks.bitcoin;
-        const rootNode = bip32.fromBase58(canonical, bip32Net);
-        const xpubDepth = rootNode.depth;
-        const coinType = isTestnet ? 1 : 0;
-
-        let totalUtxoCount = 0;
-        let totalSatsFound = 0;
+        const BATCH = 5, DELAY = 200;
+        const found = [], empty = [];
+        for (let i = 0; i < entries.length; i += BATCH) {
+          go.textContent = `Checking ${Math.min(i + BATCH, entries.length)}/${entries.length}…`;
+          const batch = entries.slice(i, i + BATCH);
+          const responses = await Promise.allSettled(batch.map(e =>
+            fetch(`${base}/address/${e.address}/utxo`, { signal: AbortSignal.timeout(15000) })
+              .then(r => r.ok ? r.json() : Promise.reject(new Error(`API error: ${r.status}`)))));
+          responses.forEach((r, j) => {
+            const e = batch[j];
+            if (r.status === 'fulfilled' && r.value.length > 0) found.push({ ...e, utxos: r.value });
+            else empty.push(`${e.chain}/${e.index}`);
+          });
+          if (i + BATCH < entries.length) await new Promise(r => setTimeout(r, DELAY));
+        }
+        let totalUtxoCount = 0, totalSats = 0;
         const allTxids = new Set();
-
-        for (const addrType of addressTypes) {
-          for (const chain of [0, 1]) {
-            const chainLabel = chain === 0 ? 'receive' : 'change';
-            statusEl.textContent = `Scanning ${addrType.type} ${chainLabel} addresses...`;
-
-            const found = await scanXpubAddresses(
-              xpubStr, chain, addrType, net, base,
-              (idx, gap, foundCount) => {
-                statusEl.textContent = `Scanning ${addrType.type} ${chainLabel}: checked ${idx} addresses, gap ${gap}/20, ${foundCount} with UTXOs`;
-              }
-            );
-
-            if (found.length > 0) {
-              // Add source label for this type+chain group
-              const chainSats = found.reduce((s, f) => s + f.utxos.reduce((ss, u) => ss + u.value, 0), 0);
-              const chainBtc = (chainSats / 1e8).toFixed(8).replace(/\.?0+$/, '');
-              const chainUtxoCount = found.reduce((s, f) => s + f.utxos.length, 0);
-
-              const label = document.createElement('div');
-              label.className = 'utxo-source-label';
-              // One scan = one wallet = one fingerprint: stamp the xpub so a
-              // fingerprint typed into ANY of this scan's labels mirrors to
-              // all of them (the scan creates one label per type+chain group).
-              label.setAttribute('data-xpub-source', xpubStr);
-              const shortXpub = xpubStr.slice(0, 8) + '\u2026' + xpubStr.slice(-6);
-              label.innerHTML = `From: ${shortXpub} (${addrType.type} ${chainLabel}) ` +
-                `<span style="float:right;color:#f7931a;font-weight:bold;">${chainBtc} BTC (${chainUtxoCount} UTXO${chainUtxoCount !== 1 ? 's' : ''})</span>` +
-                `<div style="margin-top:0.3rem;"><input class="xpub-xfp" placeholder="Master fingerprint (8 hex, e.g. aabbccdd)" ` +
-                `style="width:200px;font-size:0.82rem;padding:0.2rem 0.4rem;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--text-primary);"></div>`;
-              document.getElementById('utxoContainer').appendChild(label);
-
-              // Propagate fingerprint to all UTXOs under this label
-              const xfpInput = label.querySelector('.xpub-xfp');
-              xfpInput.addEventListener('input', () => {
-                const val = xfpInput.value.trim();
-                let el = label.nextElementSibling;
-                while (el && !el.classList.contains('utxo-source-label')) {
-                  if (el.hasAttribute('data-utxo')) {
-                    const hwXfp = el.querySelector('.hw-xfp');
-                    if (hwXfp) hwXfp.value = val;
-                  }
-                  el = el.nextElementSibling;
-                }
-                // Mirror into this scan's other labels (same xpub) so every
-                // type+chain group -- and the rows under it -- get the value.
-                document.querySelectorAll('.utxo-source-label[data-xpub-source]').forEach(other => {
-                  if (other === label) return;
-                  if (other.getAttribute('data-xpub-source') !== xpubStr) return;
-                  const otherXfp = other.querySelector('.xpub-xfp');
-                  if (otherXfp && otherXfp.value !== xfpInput.value) {
-                    otherXfp.value = xfpInput.value;
-                    otherXfp.dispatchEvent(new Event('input'));
-                  }
-                });
-              });
-
-              for (const entry of found) {
-                const scriptPubKey = Buffer.from(
-                  bitcoin.address.toOutputScript(entry.address, net)
-                ).toString('hex');
-
-                // Build best-guess full derivation path for HW wallet info
-                let fullPath;
-                if (xpubDepth === 3) {
-                  // Standard account-level xpub: m/purpose'/coin'/account'/chain/index
-                  fullPath = `m/${addrType.purpose}'/${coinType}'/0'/${chain}/${entry.index}`;
-                } else {
-                  // Non-standard depth — just use relative path
-                  fullPath = `${chain}/${entry.index}`;
-                }
-
-                for (const utxo of entry.utxos) {
-                  addFetchedInput(
-                    utxo.txid, utxo.vout, utxo.value, scriptPubKey, entry.address,
-                    { xpub: xpubStr, path: fullPath, pubkey: entry.pubkey }
-                  );
-                  allTxids.add(utxo.txid);
-                  totalUtxoCount++;
-                  totalSatsFound += utxo.value;
-                }
-              }
+        for (const chain of [0, 1]) {
+          const group = found.filter(f => f.chain === chain);
+          if (!group.length) continue;
+          const groupSats = group.reduce((s, f) => s + f.utxos.reduce((ss, u) => ss + u.value, 0), 0);
+          const groupCount = group.reduce((s, f) => s + f.utxos.length, 0);
+          addXpubSourceLabel(hd.xpub, `${hd.type} ${chain === 0 ? 'receive' : 'change'}`, groupSats, groupCount);
+          for (const entry of group) {
+            const scriptPubKey = Buffer.from(bitcoin.address.toOutputScript(entry.address, net)).toString('hex');
+            const fullPath = hdFullPath(entry.chain, entry.index);
+            for (const utxo of entry.utxos) {
+              addFetchedInput(utxo.txid, utxo.vout, utxo.value, scriptPubKey, entry.address,
+                { xpub: hd.xpub, path: fullPath, pubkey: Buffer.from(entry.pubkey).toString('hex') });
+              allTxids.add(utxo.txid);
+              totalUtxoCount++; totalSats += utxo.value;
             }
           }
         }
-
+        // Selected-but-empty addresses are reported, so picking the wrong
+        // type or wallet is visible immediately instead of a silent zero.
+        const emptyNote = empty.length
+          ? ` No UTXOs on: ${empty.slice(0, 8).join(', ')}${empty.length > 8 ? ` +${empty.length - 8} more` : ''}.`
+          : '';
         if (totalUtxoCount === 0) {
-          statusEl.textContent = 'No UTXOs found for this extended public key.';
-          return;
+          statusEl.textContent = `No UTXOs found on the ${entries.length} selected address(es).` + emptyNote;
+        } else {
+          await Promise.allSettled(Array.from(allTxids).map(txid => fetchRawTx(txid)));
+          const totalBtc = (totalSats / 1e8).toFixed(8).replace(/\.?0+$/, '');
+          statusEl.textContent = `Imported ${totalUtxoCount} UTXO(s) (${totalBtc} BTC) from ` +
+            `${found.length} of ${entries.length} selected address(es).` + emptyNote;
+          clearFetchInputIfStill(hd.xpub);
         }
-
-        statusEl.textContent = `Found ${totalUtxoCount} UTXO(s). Fetching full transactions...`;
-
-        // Fetch raw txs for nonWitnessUtxo
-        await Promise.allSettled(Array.from(allTxids).map(txid => fetchRawTx(txid)));
-
-        const totalBtc = (totalSatsFound / 1e8).toFixed(8).replace(/\.?0+$/, '');
-        statusEl.textContent = `Added ${totalUtxoCount} UTXO(s) (${totalBtc} BTC) from xpub scan.`;
-        clearFetchInputIfStill(xpubStr);
         updateFeeCalc();
         updateOutputPercentages();
         updateStepLayout();
+        hdCloseDialog();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
+        hd.busy = false; hdCounts();
       }
     }
+
+    document.querySelectorAll('.hd-chain').forEach(b => b.addEventListener('click', () => {
+      if (hd.busy) return;
+      hd.chain = parseInt(b.dataset.chain); hdRenderList();
+    }));
+    document.getElementById('hdLoadMore').addEventListener('click', () => { hd.shown += HD_PAGE; hdRenderList(); });
+    document.getElementById('hdSelectPage').addEventListener('change', (e) => {
+      for (let i = 0; i < hd.shown; i++) {
+        const key = `${hd.chain}/${i}`;
+        e.target.checked ? hd.selected.add(key) : hd.selected.delete(key);
+      }
+      hdRenderList();
+    });
+    document.getElementById('hdImportClose').onclick = document.getElementById('hdImportCancel').onclick = hdCloseDialog;
+    document.getElementById('hdImportGo').onclick = importHdAddresses;
 
     async function fetchUtxosFromWif(wif) {
       const statusEl = document.getElementById('fetchStatus');
@@ -3289,7 +3393,8 @@
         colourField, addInput, addFetchedInput, addOutput, updateFeeCalc,
         normalizeExtendedKey, getRelativePath, derivePublicKeyFromXpub,
         isExtendedKey, getOriginalVersionHex, pubkeyToAddress,
-        scanXpubAddresses, fetchUtxosFromXpub,
+        openHdImport, hdPickType, hdDerive, hdFullPath, importHdAddresses, hdRenderList,
+        get hdState() { return hd; },
         get XPUB_ADDRESS_TYPES() { return XPUB_ADDRESS_TYPES; },
         refreshAllScriptLabels, downloadPsbt,
         getAvailableSats, gatherOutputs, updateOutputPercentages,

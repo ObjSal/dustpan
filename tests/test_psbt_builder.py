@@ -2696,6 +2696,116 @@ def run_tests(page, base_url):
     page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = false; window._fn.resetAll(); }")
     test("resetAll: restores the test-mode default (on)", page.evaluate("() => document.getElementById('softwareSignerOverride').checked") is True)
 
+    # ========================================================
+    section("45. HD wallet import dialog")
+    # ========================================================
+    ZPUB84 = "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs"
+    VEC00 = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"   # BIP84 test vector 0/0
+    VEC01 = "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g"   # 0/1
+    VEC10 = "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el"   # 1/0 (change)
+    VEC11 = "bc1qggnasd834t54yulsep6fta8lpjekv4zj6gv5rf"   # 1/1 (change, the one the flow selects)
+    page.select_option("#network", "mainnet")
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+
+    # zpub pins the type: dialog opens straight on the list
+    page.fill("#fetchAddress", ZPUB84)
+    page.click("#fetchUtxosBtn")
+    page.wait_for_selector("#hdImportDialog", state="visible", timeout=8000)
+    r = page.evaluate("""() => ({
+        typeStep: document.getElementById('hdImportStepType').style.display,
+        badge: document.getElementById('hdTypeBadge').textContent,
+        rows: document.querySelectorAll('#hdAddrList .hd-addr-row').length,
+        first: document.querySelector('#hdAddrList .hd-addr').textContent,
+        goDisabled: document.getElementById('hdImportGo').disabled })""")
+    test("zpub: type step skipped, Native SegWit badge", r["typeStep"] == "none" and r["badge"] == "Native SegWit")
+    test("zpub: 20 rows shown", r["rows"] == 20)
+    test("zpub: 0/0 is the BIP84 test-vector address", r["first"] == VEC00, r["first"])
+    test("dialog: Import disabled with nothing selected", r["goDisabled"] is True)
+
+    # pagination + change toggle + selection persistence
+    page.click("#hdLoadMore")
+    test("Show 20 more: 40 rows", page.evaluate("() => document.querySelectorAll('#hdAddrList .hd-addr-row').length") == 40)
+    page.evaluate("() => { const b = document.querySelectorAll('#hdAddrList input')[0]; b.checked = true; b.dispatchEvent(new Event('change')); }")
+    page.click('.hd-chain[data-chain="1"]')
+    r = page.evaluate("""() => ({ first: document.querySelector('#hdAddrList .hd-addr').textContent,
+        count: document.getElementById('hdSelCount').textContent,
+        checked: document.querySelectorAll('#hdAddrList input:checked').length })""")
+    test("change toggle: 1/0 derives the change-chain vector", r["first"] == VEC10, r["first"])
+    test("change toggle: receive selection persists in count", r["count"] == "1 selected")
+    test("change toggle: no change rows falsely checked", r["checked"] == 0)
+    page.evaluate("() => { const b = document.querySelectorAll('#hdAddrList input')[1]; b.checked = true; b.dispatchEvent(new Event('change')); }")
+
+    # select-all-shown on receive
+    page.click('.hd-chain[data-chain="0"]')
+    page.check("#hdSelectPage")
+    test("select all shown: 40 receive + 1 change selected",
+         page.evaluate("() => window._fn.hdState.selected.size") == 41)
+    page.uncheck("#hdSelectPage")
+    test("unselect all shown: only the change selection remains",
+         page.evaluate("() => window._fn.hdState.selected.size") == 1)
+    page.evaluate("() => { const b = document.querySelectorAll('#hdAddrList input')[0]; b.checked = true; b.dispatchEvent(new Event('change')); }")
+    page.evaluate("() => { const b = document.querySelectorAll('#hdAddrList input')[1]; b.checked = true; b.dispatchEvent(new Event('change')); }")
+
+    # import: EXACTLY the selected addresses are queried; empties reported
+    hd_hits = []
+    def hd_utxo_route(route, request):
+        addr = request.url.split("/address/")[1].split("/")[0]
+        hd_hits.append(addr)
+        body = '[{"txid":"' + "ab" * 32 + '","vout":3,"value":123456,"status":{"confirmed":true}}]' if addr == VEC00 else "[]"
+        route.fulfill(status=200, content_type="application/json", body=body)
+    page.route("**/address/*/utxo", hd_utxo_route)
+    page.click("#hdImportGo")
+    page.wait_for_selector("#hdImportOverlay", state="hidden", timeout=15000)
+    page.unroute("**/address/*/utxo")
+    test("import: exactly the 3 selected addresses queried, no scan",
+         sorted(hd_hits) == sorted([VEC00, VEC01, VEC11]), f"{hd_hits}")
+    status = page.evaluate("() => document.getElementById('fetchStatus').textContent")
+    test("import: status reports found-of-selected", "Imported 1 UTXO(s)" in status and "1 of 3 selected" in status, status)
+    test("import: empty addresses listed by chain/index", "No UTXOs on: 0/1, 1/1" in status, status)
+    r = page.evaluate("""() => { const row = document.querySelector('#utxoContainer [data-utxo]');
+        return { addr: row.querySelector('.utxo-fetched-addr').textContent, path: row.querySelector('.hw-path').value,
+                 pub: row.querySelector('.hw-pubkey').value.length, xpub: row.querySelector('.hw-xpub').value,
+                 label: document.querySelector('.utxo-source-label').getAttribute('data-xpub-source') }; }""")
+    test("import: row carries full key origin from the derivation",
+         r["addr"] == VEC00 and r["path"] == "m/84'/0'/0'/0/0" and r["pub"] == 66 and r["xpub"] == ZPUB84)
+    test("import: source label stamped with the xpub (xfp mirroring)", r["label"] == ZPUB84)
+
+    # ambiguous xpub -> type chooser with real first addresses
+    page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    xpub_form = page.evaluate(f"() => window._fn.normalizeExtendedKey('{ZPUB84}').key")
+    page.fill("#fetchAddress", xpub_form)
+    page.click("#fetchUtxosBtn")
+    page.wait_for_selector("#hdImportStepType", state="visible", timeout=8000)
+    r = page.evaluate("""() => Array.from(document.querySelectorAll('.hd-type-card')).map(c => c.textContent)""")
+    test("xpub: type chooser offers Native SegWit and Taproot",
+         len(r) == 2 and "Native SegWit" in r[0] and "Taproot" in r[1], f"{[x[:40] for x in r]}")
+    test("xpub: cards show each type's real first address", VEC00[:24] in r[0] and "bc1p" in r[1])
+    page.click(".hd-type-card >> nth=1")
+    test("taproot pick: badge updates", page.evaluate("() => document.getElementById('hdTypeBadge').textContent") == "Taproot")
+    test("taproot pick: rows are bc1p", page.evaluate("() => document.querySelector('#hdAddrList .hd-addr').textContent").startswith("bc1p"))
+    page.click("#hdImportCancel")
+    test("cancel closes the dialog", page.evaluate("() => document.getElementById('hdImportOverlay').style.display") == "none")
+
+    # network mismatch messages preserved
+    page.fill("#fetchAddress", "vpub5YvMuJNjRSYon44z9QmCfdf8SqJRVNvz6m55Qy5iVjZQxDfUgtiQjnc7CC1fAbED2tAGCZRERUfvtn2DstZGU6HMns6dXXH2wujSc2wfi2x")
+    page.click("#fetchUtxosBtn")
+    time.sleep(0.3)
+    test("testnet key on mainnet: rejected with message",
+         "Testnet extended key but mainnet selected" in page.evaluate("() => document.getElementById('fetchStatus').textContent"))
+
+    # Checksum-broken key: isExtendedKey() itself checksum-validates, so the
+    # UI dispatch sends it down the address branch; the dialog's own guard is
+    # defense-in-depth for direct/future callers.
+    broken = ZPUB84[:-1] + ("t" if ZPUB84[-1] != "t" else "u")
+    page.fill("#fetchAddress", broken)
+    page.click("#fetchUtxosBtn")
+    time.sleep(0.3)
+    test("checksum-broken key via UI: address-branch rejection",
+         "Invalid address for selected network" in page.evaluate("() => document.getElementById('fetchStatus').textContent"))
+    page.evaluate("(k) => window._fn.openHdImport(k)", broken)
+    test("checksum-broken key via openHdImport: clean message, no throw",
+         "Invalid extended public key" in page.evaluate("() => document.getElementById('fetchStatus').textContent"))
+
     # A fingerprint typed into ANY label of an xpub scan mirrors to the scan's
     # other labels (one is created per address-type + chain group) and their rows.
     page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")

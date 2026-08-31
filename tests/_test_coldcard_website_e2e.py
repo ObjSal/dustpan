@@ -220,11 +220,22 @@ def run_tests():
         page.select_option("#network", "testnet")
         page.wait_for_timeout(500)
 
-        # Fetch WIF UTXOs
+        # Fetch WIF UTXOs. mempool.space rate-limits after the funding/API
+        # churn in section 1, so retry a couple of times (the page clears the
+        # WIF from the input after each attempt).
         print("  Fetching WIF UTXOs...")
-        page.fill("#fetchAddress", wif_key)
-        page.click("#fetchUtxosBtn")
-        page.wait_for_selector("#utxoContainer [data-utxo]", timeout=30000)
+        for attempt in range(3):
+            page.fill("#fetchAddress", wif_key)
+            page.click("#fetchUtxosBtn")
+            try:
+                page.wait_for_selector("#utxoContainer [data-utxo]", timeout=40000)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                print(f"  WIF fetch attempt {attempt + 1} empty "
+                      f"({page.evaluate("() => document.getElementById('fetchStatus').textContent")!r}); retrying...")
+                time.sleep(15)
         # WIF is cleared from input after fetch
         page.wait_for_timeout(1000)
 
@@ -233,13 +244,26 @@ def run_tests():
 
         # Fetch CC UTXOs by the ACCOUNT XPUB. The website no longer lets a
         # plain address row be given HW info by hand (it cannot be done
-        # correctly without the per-address pubkey); the xpub scan fills the
-        # path and pubkey for every UTXO and the fingerprint is typed once.
-        print("  Fetching CC UTXOs by account xpub...")
+        # correctly without the per-address pubkey); the HD import dialog
+        # fills the path and pubkey for every imported address and the
+        # fingerprint is typed once. The funded CC address is 0/0, so only
+        # that address is selected -- nothing else touches mempool.space.
+        print("  Importing CC UTXOs via the HD wallet dialog...")
         page.fill("#fetchAddress", CC_XPUB)
         page.click("#fetchUtxosBtn")
-        # Wait for more UTXOs to appear
-        page.wait_for_timeout(5000)
+        page.wait_for_selector("#hdImportDialog", state="visible", timeout=10000)
+        # tpub is ambiguous (Native SegWit or Taproot): pick Native SegWit
+        if page.locator("#hdImportStepType").is_visible():
+            page.click(".hd-type-card >> nth=0")
+        page.wait_for_selector("#hdAddrList .hd-addr-row", timeout=5000)
+        first_addr = page.locator("#hdAddrList .hd-addr").first.text_content()
+        test("dialog: 0/0 matches the funded CC address", first_addr == CC_ADDR,
+             f"dialog={first_addr} expected={CC_ADDR}")
+        page.evaluate("""() => { const b = document.querySelectorAll('#hdAddrList input')[0];
+            b.checked = true; b.dispatchEvent(new Event('change')); }""")
+        page.click("#hdImportGo")
+        page.wait_for_selector("#hdImportOverlay", state="hidden", timeout=60000)
+        page.wait_for_timeout(500)
 
         total_utxo_count = page.locator("#utxoContainer [data-utxo]").count()
         cc_utxo_count = total_utxo_count - wif_utxo_count
