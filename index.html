@@ -446,22 +446,23 @@
   </div>
 
   <script src="qr_generator.js"></script>
+  <script src="vendor/deps.js"></script>
   <script type="module">
-    // SUPPLY CHAIN: every import below MUST carry an exact version. This page
-    // handles WIF private keys; an unpinned specifier lets the CDN serve a new
-    // release at page load, so a single compromised publish would run with
-    // access to those keys. ESM imports cannot carry SRI hashes, so the pin is
-    // the only defence short of self-hosting. Never relax one to a range.
-    import { Buffer } from 'https://esm.sh/buffer@6.0.3?target=es2022';
+    // SUPPLY CHAIN: this page handles WIF private keys, so it never imports
+    // library code from a CDN at load time. All dependencies below come from
+    // vendor/deps.js — a single local, auditable bundle built only from
+    // hash-pinned npm tarballs (vendor/pins.json) by tools/vendor-deps.py.
+    // `tools/vendor-deps.py --verify` re-checks every tarball hash against
+    // vendor/pins.json and rebuilds the bundle byte-for-byte to prove it
+    // matches those pins; tools/audit-vendor.py is a separate pattern scan of
+    // the built bundle for network/exfil/dynamic-code primitives (fetch,
+    // eval, Function, etc.) — neither one diffs the bundle against its
+    // vendored source. To upgrade a dependency, run `python3
+    // tools/vendor-deps.py --bump pkg@version` and rerun the unit suite —
+    // never add a CDN import here.
+    const { Buffer, bitcoin, ecc, BIP32Factory, ECPairFactory, bs58check, splitQRs, joinQRs, jsQR } = window.__vendor;
     window.Buffer = Buffer;
-    import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@7.0.1';
-    import { splitQRs, joinQRs } from 'https://esm.sh/bbqr@1.2.0';
-    import jsQR from 'https://esm.sh/jsqr@1.4.0';
-    import * as ecc from 'https://cdn.jsdelivr.net/npm/@bitcoin-js/tiny-secp256k1-asmjs@2.2.3/+esm';
     bitcoin.initEccLib(ecc);
-    import BIP32Factory from 'https://esm.sh/bip32@4.0.0?target=es2022';
-    import bs58check from 'https://esm.sh/bs58check@3.0.1?target=es2022';
-    import { ECPairFactory } from 'https://esm.sh/ecpair@3.0.0';
     const bip32 = BIP32Factory(ecc);
     const ECPair = ECPairFactory(ecc);
     let finalPsbt = null;
