@@ -816,7 +816,9 @@
     async function fetchRawTx(txid) {
       if (rawTxCache.has(txid)) return rawTxCache.get(txid);
       const base = getMempoolBaseUrl();
-      const resp = await fetch(`${base}/tx/${txid}/hex`);
+      // Bounded: this is awaited inside the Create click; a stalled
+      // mempool.space response used to hang creation with no feedback.
+      const resp = await fetch(`${base}/tx/${txid}/hex`, { signal: AbortSignal.timeout(10000) });
       if (!resp.ok) throw new Error(`Failed to fetch tx ${txid}: ${resp.status}`);
       const hex = await resp.text();
       rawTxCache.set(txid, hex);
@@ -862,7 +864,7 @@
       const buttons = document.querySelectorAll('.fee-preset');
       try {
         const base = getMempoolBaseUrl();
-        const resp = await fetch(`${base}/v1/fees/recommended`);
+        const resp = await fetch(`${base}/v1/fees/recommended`, { signal: AbortSignal.timeout(10000) });
         if (!resp.ok) throw new Error(`Fee API error: ${resp.status}`);
         const fees = await resp.json();
         buttons.forEach(btn => {
@@ -912,7 +914,7 @@
 
       try {
         const base = getMempoolBaseUrl();
-        const resp = await fetch(`${base}/address/${address}/utxo`);
+        const resp = await fetch(`${base}/address/${address}/utxo`, { signal: AbortSignal.timeout(15000) });
         if (!resp.ok) throw new Error(`API error: ${resp.status}`);
         const utxos = await resp.json();
 
@@ -1211,7 +1213,7 @@
 
         for (const { addr, type } of addresses) {
           statusEl.textContent = `Fetching ${type} UTXOs...`;
-          const resp = await fetch(`${base}/address/${addr}/utxo`);
+          const resp = await fetch(`${base}/address/${addr}/utxo`, { signal: AbortSignal.timeout(15000) });
           if (!resp.ok) throw new Error(`API error: ${resp.status}`);
           const utxos = await resp.json();
 
@@ -3057,7 +3059,7 @@
 
     // Fetches the chain tip height. mempool.space and server.py both answer
     // /blocks/tip/height with a plain integer.
-    async function fetchTipHeight() {
+    async function fetchTipHeight({ attempts = 2, timeoutMs = 10000 } = {}) {
       // Only the most recent request may write the result. The page fires a
       // fetch on load (dropdown still at its default) and again when network
       // detection settles; a slow mainnet response arriving after the fast
@@ -3065,21 +3067,35 @@
       // which the node rejected as non-final.
       const seq = ++tipFetchSeq;
       let h = null;
-      try {
-        const base = getMempoolBaseUrl();
-        const resp = await fetch(`${base}/blocks/tip/height`, { signal: AbortSignal.timeout(5000) });
-        if (!resp.ok) throw new Error(`Tip API error: ${resp.status}`);
-        const parsed = parseInt((await resp.text()).trim(), 10);
-        if (!Number.isInteger(parsed) || parsed < 0) throw new Error('Bad tip height');
-        h = parsed;
-      } catch {
-        h = null;
+      // Two attempts with a generous per-attempt timeout: mempool.space
+      // normally answers in ~1s but can stall well past 5s when rate-limited,
+      // and an aborted attempt shows in devtools as a "cancelled" request
+      // with the height stuck on "unknown".
+      for (let attempt = 0; attempt < attempts && h === null; attempt++) {
+        if (seq !== tipFetchSeq) return tipHeight;  // superseded mid-retry
+        try {
+          const base = getMempoolBaseUrl();
+          const resp = await fetch(`${base}/blocks/tip/height`, { signal: AbortSignal.timeout(timeoutMs) });
+          if (!resp.ok) throw new Error(`Tip API error: ${resp.status}`);
+          const parsed = parseInt((await resp.text()).trim(), 10);
+          if (!Number.isInteger(parsed) || parsed < 0) throw new Error('Bad tip height');
+          h = parsed;
+        } catch {
+          h = null;
+        }
       }
       if (seq !== tipFetchSeq) return tipHeight;  // superseded by a newer request
-      tipHeight = h;
-      tipHeightFetchedAt = h === null ? 0 : Date.now();
-      if (getLocktimeMode() === 'block' && locktimeAuto) {
-        locktimeBlockEl.value = tipHeight === null ? '' : tipHeight;
+      // A failed refresh KEEPS the last known height: a slightly stale
+      // anti-fee-sniping height (still far above any old block) is strictly
+      // better than clearing the field and refusing to create. mempool.space
+      // rate-limits bursts, so mid-session failures are routine. Height is
+      // only "unknown" when no fetch has ever succeeded.
+      if (h !== null) {
+        tipHeight = h;
+        tipHeightFetchedAt = Date.now();
+      }
+      if (getLocktimeMode() === 'block' && locktimeAuto && tipHeight !== null) {
+        locktimeBlockEl.value = tipHeight;
       }
       updateLocktimeSummary();
       return tipHeight;
@@ -3091,7 +3107,10 @@
     async function refreshTipHeightIfStale(maxAgeMs = 10 * 60 * 1000) {
       if (getLocktimeMode() !== 'block' || !locktimeAuto) return;
       if (tipHeight !== null && Date.now() - tipHeightFetchedAt < maxAgeMs) return;
-      await fetchTipHeight();
+      // Short budget: this await sits inside the Create click. A failure
+      // falls back to the last known height (kept above), so one quick
+      // attempt is enough here; the patient retry is for background fetches.
+      await fetchTipHeight({ attempts: 1, timeoutMs: 4000 });
     }
 
     function resetLocktime() {
@@ -3120,9 +3139,12 @@
     });
     setLocktimeMode('block');
 
-    // Fetch fee rates and chain tip on load
+    // Fetch fee rates on load. The chain tip is NOT fetched here: network
+    // detection always dispatches a change event when it settles, and the
+    // change handler fetches the tip -- a second fetch at load just doubles
+    // the burst against mempool.space's rate limiting (and its result would
+    // be discarded by the sequence guard anyway).
     fetchFeeRates();
-    fetchTipHeight();
 
     // Fetch UTXOs button
     document.getElementById('fetchUtxosBtn').addEventListener('click', fetchUtxos);
