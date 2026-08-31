@@ -436,6 +436,14 @@ class ReusableTCPServer(HTTPServer):
     allow_reuse_address = True
     allow_reuse_port = True
 
+    def handle_error(self, request, client_address):
+        # A client dropping a connection mid-transfer is routine; the default
+        # handler prints a full traceback, which trips run_all.py's abort scan.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
     def process_request(self, request, client_address):
         """Handle each request in a new thread to prevent single-threaded blocking."""
         import threading
