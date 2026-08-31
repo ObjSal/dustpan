@@ -10,7 +10,7 @@ This tool lets multiple wallet holders collaborate on a single Bitcoin transacti
 
 ### Workflow
 
-1. **Create** -- Add inputs (UTXOs) from multiple wallets by address or xpub, set outputs and fee, then download the unsigned PSBT or display it as a QR code
+1. **Create** -- Add inputs (UTXOs) from multiple wallets by address, xpub (HD wallet import dialog), or WIF, set outputs and fee, then download the unsigned PSBT or display it as a QR code
 2. **Sign** -- Each wallet holder signs the PSBT with their own wallet (hardware wallet, Bitcoin Core, hot wallet, or paper wallet)
 3. **Combine & Finalize** -- Upload all signed PSBTs, the tool merges signatures and produces the raw transaction
 4. **Broadcast** -- Send the finalized transaction to the Bitcoin network via mempool.space
@@ -26,18 +26,22 @@ Both approaches work through the same Combine & Finalize step.
 
 ## Features
 
-- **Fetch UTXOs** by address, extended public key (xpub/zpub/vpub/tpub/ypub/upub), or WIF private key from mempool.space (or local regtest server) -- xpub input auto-derives P2WPKH and/or P2TR addresses and scans receive + change chains with BIP44 gap limit; WIF input derives both P2WPKH and P2TR addresses and fetches UTXOs from both
+- **Fetch UTXOs** by address, extended public key (xpub/zpub/vpub/tpub/ypub/upub), or WIF private key from mempool.space (or local regtest server) -- pasting an extended key opens an **Import HD Wallet** dialog that derives receive/change addresses locally (free, unlimited paging) and fetches UTXOs for exactly the addresses you tick; WIF input derives both P2WPKH and P2TR addresses and fetches UTXOs from both
 - **Inline signing** for hot/paper wallets -- when all UTXOs have WIF private keys, signs and finalizes the transaction in-browser without needing external signing tools, going straight from Create to Broadcast
 - **Fee rate presets** pulled live from the network (fast/medium/slow), with estimated fee and available sats display
+- **Transaction preview** on both steps -- verdict, stats, and money-flow diagram rendered by a sandboxed [PSBT Decoder](https://github.com/ObjSal/psbt-decoder) iframe, with a link to the full decoder
+- **Anti-fee-sniping lock time** (None / Block / Date presets) defaulting to the current block height, matching Bitcoin Core, Electrum, and Sparrow
+- **Key-origin enforcement** -- every input must carry either its WIF or a complete key origin (fingerprint + path + pubkey, supplied automatically by xpub fetches), plus guards that catch the Coldcard Q legacy-scriptSig finalize bug before broadcast
 - **Optional tip** with preset percentages (0.99%, 0.5%, 0.1%) and per-network donation addresses -- included as a PSBT output only when sats > 0
 - **Output percentage labels** showing each output's share of total input, with a Wipe option to sweep remaining balance
 - **QR code display** using [BBQr](https://bbqr.org/) protocol for air-gapped signing with hardware wallets like Coldcard Q (auto-splits large PSBTs into animated multi-part QR sequences)
 - **QR code scanning** to upload signed PSBTs from hardware wallets via camera, with BBQr multi-part support and progress bar -- combine QR-scanned and file-uploaded PSBTs from different sources
+- **Camera scanning on the Create step** -- scan an address, WIF, xpub, BIP21 URI, or paper-wallet sweep URL straight into the fetch box
 - **Hardware wallet support** with BIP32 derivation paths, master fingerprint input (per xpub source, auto-propagated to all UTXOs), and xpub auto-derivation of compressed public keys (supports xpub/ypub/zpub/vpub/tpub/upub formats via SLIP-132 normalization)
 - **CLI signing tool** (`tools/sign-psbt.py`) for hot wallet signing with WIF keys
 - **Network auto-selection** -- Mainnet on GitHub Pages, Testnet4 on local static server, Regtest with regtest server
 - **Network support** for Mainnet, Testnet4, and Regtest
-- **Step indicator wizard** with dynamic step flow -- adapts between 2-step (Create → Broadcast) and 4-step (Create → Sign → Combine → Broadcast) modes based on whether WIF keys are present
+- **Step indicator wizard** with two steps (Create → Broadcast) -- the Broadcast step adapts to the inputs: all-WIF sweeps sign inline and go straight to broadcast, hardware-wallet flows show upload/combine first
 - **Guided workflow** with brief instructions under each step
 - **No server required** -- runs entirely in the browser on GitHub Pages
 - **Regtest mode** with a local Python server for development and testing
@@ -65,27 +69,37 @@ The server provides a faucet and auto-mining, and exposes mempool.space-compatib
 ## Testing
 
 ```bash
-# Unit tests -- index.html, 194 tests, no bitcoind needed (~15s)
+# Preferred: run every local suite in the right order with per-suite logs
+python3 tests/run_all.py             # everything that runs locally
+python3 tests/run_all.py --testnet4  # + the two real-testnet4 Coldcard suites
+python3 tests/run_all.py --list      # show the plan / skip reasons
+
+# Unit tests -- index.html, 360 tests, no bitcoind needed (~45s)
 python3 tests/test_psbt_builder.py
+
+# Byte-for-byte comparison against Bitcoin Core -- 85 tests
+# Asserts the unsigned tx is identical to createrawtransaction output;
+# needs an existing regtest node (CN_NODE_HOST/CN_NODE_PORT + RPC credentials via env)
+python3 tests/test_core_tx_comparison.py
 
 # E2E regtest tests -- 148 tests, requires bitcoind + bitcoin-cli (~120s)
 # Covers P2WPKH + P2TR (Taproot), parallel + serial signing,
 # WIF fetch + inline signing, and mixed WIF partial signing
 python3 tests/test_regtest_e2e.py
 
-# Coldcard simulation tests -- 44 tests, requires bitcoind + embit (~120s)
+# Coldcard simulation tests -- 43 tests, requires bitcoind + embit (~120s)
 # Simulates Coldcard signing via bitcoin-cli walletprocesspsbt
 python3 tests/test_coldcard_simulation.py
 
-# Real Coldcard MK4 regtest tests -- 28 tests, requires Coldcard + ckcc + bitcoind + embit
-# User approves transaction on the Coldcard when prompted
+# Coldcard regtest tests -- 29 tests, requires ckcc + bitcoind + embit
+# Uses the Coldcard firmware's headless simulator; COLDCARD_PHYSICAL=1 for a real MK4
 python3 tests/_test_coldcard_regtest.py
 
-# Real Coldcard MK4 testnet4 tests -- 25 tests, requires Coldcard + ckcc + embit
+# Coldcard testnet4 tests -- 26 tests, requires ckcc + embit (simulator or real MK4)
 # Builds mixed WIF+CC PSBT, signs via ckcc, broadcasts to testnet4
 python3 tests/_test_coldcard_testnet4.py
 
-# Website + Coldcard E2E tests -- 23 tests, requires Coldcard + ckcc + Playwright
+# Website + Coldcard E2E tests -- 25 tests, requires ckcc + Playwright
 # Full browser flow: fetch UTXOs, set HW info, create/sign/combine/broadcast
 python3 tests/_test_coldcard_website_e2e.py
 
@@ -132,14 +146,14 @@ python3 tools/sign-psbt.py unsigned.psbt <WIF-private-key>
 
 - Python 3
 - [Playwright](https://playwright.dev/python/): `pip install playwright && playwright install chromium`
-- [embit](https://github.com/nicolo-ribaudo/embit): `pip install embit` (for `tools/sign-psbt.py` and Coldcard tests)
+- [embit](https://github.com/diybitcoin/embit): `pip install embit` (for `tools/sign-psbt.py` and Coldcard tests)
 - [ckcc-protocol](https://github.com/Coldcard/ckcc-protocol): `pip install ckcc-protocol` (for real Coldcard MK4 tests only)
 - Bitcoin Core v30+ (for regtest E2E tests only)
 
 ## Tech Stack
 
 - **Frontend**: `index.html` (sweeper) + `donate.html`, no build step
-- **JS Libraries** (loaded via CDN/esm.sh): [bitcoinjs-lib](https://github.com/nicolo-ribaudo/bitcoinjs-lib) v7.0.0-rc.0, [bip32](https://github.com/nicolo-ribaudo/bip32) v4.0.0, [bs58check](https://github.com/nicolo-ribaudo/bs58check) v3.0.1, [ecpair](https://github.com/nicolo-ribaudo/ecpair) v3.0.0, [bbqr](https://github.com/nicolo-ribaudo/bbqr-js), [jsQR](https://github.com/nicolo-ribaudo/jsQR)
+- **JS Libraries** (loaded via CDN/esm.sh): [bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) v7.0.1, [bip32](https://github.com/bitcoinjs/bip32) v4.0.0, [bs58check](https://github.com/bitcoinjs/bs58check) v3.0.1, [ecpair](https://github.com/bitcoinjs/ecpair) v3.0.0, [bbqr](https://github.com/coinkite/BBQr), [jsQR](https://github.com/cozmo/jsQR)
 - **QR Generator**: Custom `qr_generator.js` (shared with [bitcoin-gift-paper-wallet](https://github.com/ObjSal/bitcoin-gift-paper-wallet))
 - **Dev Server**: Python stdlib (`http.server`) + Bitcoin Core RPC
 - **Tests**: [Playwright](https://playwright.dev/python/) (Python sync API)
