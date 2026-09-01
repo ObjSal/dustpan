@@ -46,6 +46,7 @@ Both approaches work through the same Combine & Finalize step.
 - **Step indicator wizard** with two steps (Create → Broadcast) -- the Broadcast step adapts to the inputs: all-WIF sweeps sign inline and go straight to broadcast, hardware-wallet flows show upload/combine first
 - **Guided workflow** with brief instructions under each step
 - **No server required** -- runs entirely in the browser on GitHub Pages
+- **Offline build for Tails** -- `tools/build-offline.py` produces one self-contained `dustpan-offline.html` for `file://` use with no server and no network calls (see [Offline build (Tails)](#offline-build-tails) below)
 - **Regtest mode** with a local Python server for development and testing
 
 ## Usage
@@ -68,6 +69,33 @@ open http://localhost:8000/index.html
 
 The server provides a faucet and auto-mining, and exposes mempool.space-compatible API endpoints so the frontend works identically across all networks.
 
+### Offline build (Tails)
+
+Tor Browser on [Tails](https://tails.net/) can't reach `localhost` (no dev server) and can't install a PWA, so the offline deliverable is **one self-contained HTML file** opened straight from disk (`file://`) -- no server, no install. UTXOs and PSBTs move by manual entry, file upload, or QR code only; everything that needs a network call (fetching UTXOs by address/xpub, fee-rate/tip-height lookups, broadcasting) is disabled or replaced with a manual hand-off.
+
+**Build it:**
+
+```bash
+python3 tools/build-offline.py            # writes dist/dustpan-offline.html
+python3 tools/build-offline.py --release  # + dist/dustpan-offline.html.sha256,
+                                           #   and prints (does not run) the
+                                           #   gpg detached-sign command
+```
+
+Requires the `psbt-decoder` submodule to be checked out (`git submodule update --init`) -- it's composed into the offline file's Transaction Preview at build time, never modified.
+
+**Verify before trusting it:**
+
+```bash
+cd dist
+shasum -a 256 -c dustpan-offline.html.sha256   # integrity
+gpg --verify dustpan-offline.html.asc dustpan-offline.html  # authenticity, if you signed a release
+```
+
+**Get it onto Tails:** copy `dustpan-offline.html` (and its `.sha256`/`.asc` if you built `--release`) to a USB drive, then copy it from the USB drive into your Tails **Home** or **Persistent Storage** folder -- Tor Browser's sandbox can't read arbitrary USB mount paths directly. Open it with `File → Open File...` (a `file://` URL). Tor Browser's **Security Level** must be **Standard** or **Safer** -- **Safest disables JavaScript**, and this is a JavaScript wallet, so it can't run at all under Safest.
+
+**What's different offline:** an **OFFLINE** badge appears next to the title; the network defaults to Mainnet with no server probe; the "Fetch Unspent" row is replaced with a hint to add inputs manually (`+ Add Input`: txid/vout/value/scriptPubKey) or build the PSBT elsewhere and sign it here; the fee rate is manual-only (defaults to 1 sat/vB); lock time still defaults to Block mode but you type the current height yourself (no tip-height fetch); and the Broadcast step drops the mempool.space POST for a QR code of the raw transaction (BBQr, same pipeline as PSBT display) plus the existing Download button, so you can move the finished transaction to any online device to actually broadcast it. Manual UTXO/output entry, WIF signing, and PSBT upload/scan/combine all keep working exactly as online -- they never needed a network. See `CLAUDE.md`'s "Offline build (Tails)" architecture notes for the guard-by-guard breakdown.
+
 ## Testing
 
 ```bash
@@ -76,7 +104,8 @@ python3 tests/run_all.py             # everything that runs locally
 python3 tests/run_all.py --testnet4  # + the two real-testnet4 Coldcard suites
 python3 tests/run_all.py --list      # show the plan / skip reasons
 
-# Unit tests -- index.html, 372 tests, no bitcoind needed (~45s)
+# Unit tests -- index.html, 395 tests, no bitcoind needed (~45s)
+# Includes building and driving the offline (Tails) single-file build via file://
 python3 tests/test_psbt_builder.py
 
 # Byte-for-byte comparison against Bitcoin Core -- 85 tests

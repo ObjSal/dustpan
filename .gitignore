@@ -150,3 +150,6 @@ tests/_logs/
 # vendor-deps.py build scratch (the actual build always happens in a system temp dir, but
 # guard against __pycache__ from running the tools/ scripts directly)
 tools/__pycache__/
+
+# tools/build-offline.py output (dustpan-offline.html + .sha256) -- built, not committed
+dist/

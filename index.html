@@ -206,7 +206,7 @@
 </head>
 <body>
 <div class="container">
-  <h1><span style="color:var(--btc-orange);">Dust</span>pan</h1>
+  <h1><span style="color:var(--btc-orange);">Dust</span>pan <span id="offlineBadge" style="display:none;font-size:0.62rem;font-weight:700;letter-spacing:0.05em;vertical-align:middle;padding:0.2rem 0.5rem;border-radius:999px;background:rgba(231,76,60,0.15);border:1px solid var(--danger);color:var(--danger);">OFFLINE</span></h1>
   <p class="subtitle">Sweep bitcoin across hardware, hot & paper wallets</p>
 
   <div class="network-bar">
@@ -253,6 +253,11 @@
           </div>
         </div>
         <div id="fetchStatus" style="font-size:0.85rem;color:var(--text-secondary);margin-top:0.3rem;"></div>
+      </div>
+      <div id="offlineFetchHint" style="display:none;color:var(--text-secondary);font-size:0.85rem;margin-bottom:1rem;">
+        Offline build &mdash; UTXO lookups need a network, so add each one manually with
+        <strong>+ Add Input</strong> (txid, vout, value in sats, scriptPubKey), or build the PSBT on
+        another device and upload/scan it below to sign.
       </div>
       <div id="utxoContainer"></div>
       <button type="button" id="addInputButton" class="btn-secondary">+ Add Input <span style="color:var(--text-secondary);font-size:0.82rem;font-weight:normal;">(manual entry)</span></button>
@@ -391,6 +396,11 @@
       <div id="finalTxPreview" class="tx-preview"></div>
       <p style="color:var(--text-secondary);font-size:0.85rem;margin-top:0;">Download the finalized transaction for your records or broadcast it to the Bitcoin network.</p>
       <button id="downloadFinalPsbt" class="btn-secondary">Download Transaction</button>
+      <button id="showFinalTxQr" class="btn-secondary" style="display:none;margin-top:0.5rem;">Show QR Code</button>
+      <div id="finalTxQrDisplay" style="display:none; text-align:center; margin-top:1rem;">
+        <canvas id="finalTxQrCanvas" style="display:block; margin:0 auto;"></canvas>
+        <div id="finalTxQrPartInfo" style="color:var(--text-secondary); font-size:0.8rem; margin-top:0.3rem;"></div>
+      </div>
       <button id="broadcastTx" class="btn-success" style="margin-top:0.5rem;">Broadcast via mempool.space</button>
       <pre id="broadcastResult"></pre>
     </div>
@@ -445,6 +455,14 @@
     </div>
   </div>
 
+  <!-- OFFLINE:FLAG (tools/build-offline.py replaces this comment with
+       <script>window.__OFFLINE_BUILD__ = true;</script> in the built file;
+       absent here, so this is a normal online page.) -->
+  <!-- OFFLINE:DECODER_DOC (tools/build-offline.py replaces this comment with
+       <script type="text/plain" id="offlineDecoderDoc"> holding the
+       base64-encoded, self-contained psbt-decoder document used by
+       getOfflineDecoderDoc() below. Absent in the online page; the offline
+       branches that read it only run when window.__OFFLINE_BUILD__ is set.) -->
   <script src="qr_generator.js"></script>
   <script src="vendor/deps.js"></script>
   <script type="module">
@@ -521,6 +539,10 @@
         inspect.title = 'Open in PSBT Decoder';
         inspect.style.cssText = 'white-space:nowrap; font-size:0.82rem;';
         inspect.href = decoderUrl(Buffer.from(item.data).toString('hex'), false);
+        // Offline build ships no standalone psbt-decoder/ page to open in a
+        // new tab -- the Transaction Preview panel (embedded, srcdoc-based)
+        // covers inspection instead.
+        if (window.__OFFLINE_BUILD__) inspect.style.display = 'none';
         const removeBtn = document.createElement('button');
         removeBtn.className = 'remove';
         removeBtn.textContent = '\u00d7';
@@ -829,6 +851,22 @@
     let networkDetected = false;  // true once detectServer() has set #network
     const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
     (async function detectServer() {
+      // Offline build: no server can ever answer, and the file:// origin
+      // can't make the request anyway -- skip it outright rather than
+      // letting it fail, so a Tails/Tor Browser session never fires a single
+      // network request at load. Falls through to the same "not localhost"
+      // branch below, which already defaults to mainnet.
+      if (window.__OFFLINE_BUILD__) {
+        const networkEl = document.getElementById('network');
+        if (!window.__TEST_MODE__) {
+          const opt = document.querySelector('#network option[value="regtest"]');
+          if (opt) opt.remove();
+        }
+        networkEl.dispatchEvent(new Event('change'));
+        if (typeof updateBroadcastLabel === 'function') updateBroadcastLabel();
+        networkDetected = true;
+        return;
+      }
       try {
         const resp = await fetch('/api/health', { signal: AbortSignal.timeout(2000) });
         const data = await resp.json();
@@ -903,6 +941,10 @@
     }
 
     async function fetchFeeRates() {
+      // Offline build: no mempool.space to ask. Fee rate is manual-only (see
+      // the offline-init block below, which hides the preset buttons and
+      // defaults the field to 1 sat/vB).
+      if (window.__OFFLINE_BUILD__) return;
       const buttons = document.querySelectorAll('.fee-preset');
       try {
         const base = getMempoolBaseUrl();
@@ -2528,26 +2570,57 @@
       renderTxPreview('finalTxPreview', hex);
     }
 
+    // Offline build: the decoder is composed at build time (by
+    // tools/build-offline.py, from the psbt-decoder submodule's own files --
+    // the submodule itself is never edited) into a base64 payload stashed in
+    // a <script type="text/plain" id="offlineDecoderDoc"> element. Decoded
+    // once and cached, then handed to the iframe via `srcdoc` (there is no
+    // psbt-decoder/ directory to point a `src` at inside one file) and driven
+    // with a postMessage instead of a URL #fragment, since a srcdoc document
+    // has no real location for the decoder's own js/app.js to read.
+    let _offlineDecoderDoc = null;
+    function getOfflineDecoderDoc() {
+      if (_offlineDecoderDoc) return _offlineDecoderDoc;
+      const el = document.getElementById('offlineDecoderDoc');
+      if (!el) throw new Error('offline decoder document missing (was this built by tools/build-offline.py?)');
+      const bin = atob(el.textContent.trim());
+      const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+      _offlineDecoderDoc = new TextDecoder('utf-8').decode(bytes);
+      return _offlineDecoderDoc;
+    }
+
     function renderTxPreview(containerId, hex) {
       const box = document.getElementById(containerId);
       if (!box) return;
       if (!hex) { box.style.display = 'none'; box.innerHTML = ''; return; }
+      const offline = !!window.__OFFLINE_BUILD__;
       box.innerHTML = `
         <div class="tx-preview-toggle">
           <h3>Transaction Preview</h3>
           <span class="tx-preview-chevron">&#9660;</span>
           <span class="tx-preview-summary"></span>
-          <a class="tx-preview-link" target="_blank" rel="noopener noreferrer">Full details in PSBT Decoder &#8599;</a>
+          ${offline ? '' : '<a class="tx-preview-link" target="_blank" rel="noopener noreferrer">Full details in PSBT Decoder &#8599;</a>'}
         </div>
         <div class="tx-preview-body">
           <iframe class="tx-preview-frame" title="Transaction preview (PSBT Decoder)"
-                  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" loading="lazy"></iframe>
-          <p class="tx-preview-note">Verdict and money flow rendered by <a href="${PSBT_DECODER_URL}" target="_blank" rel="noopener noreferrer">PSBT Decoder</a> in an isolated frame. Nothing leaves your browser. Verify every destination address and amount.</p>
+                  sandbox="${offline ? 'allow-scripts' : 'allow-scripts allow-popups allow-popups-to-escape-sandbox'}" loading="lazy"></iframe>
+          <p class="tx-preview-note">${offline
+            ? 'Verdict and money flow rendered by the embedded PSBT Decoder, running fully offline in an isolated frame. Nothing leaves your browser. Verify every destination address and amount.'
+            : `Verdict and money flow rendered by <a href="${PSBT_DECODER_URL}" target="_blank" rel="noopener noreferrer">PSBT Decoder</a> in an isolated frame. Nothing leaves your browser. Verify every destination address and amount.`}</p>
         </div>`;
       const info = txPreviewInfo(hex);
       box.querySelector('.tx-preview-summary').textContent = info.summary;
-      box.querySelector('.tx-preview-link').href = decoderUrl(hex, false);
-      box.querySelector('.tx-preview-frame').src = decoderUrl(hex, true);
+      const frame = box.querySelector('.tx-preview-frame');
+      if (offline) {
+        const network = decoderNetworkName();
+        frame.addEventListener('load', () => {
+          frame.contentWindow.postMessage({ type: 'psbt-decoder:load', hex, network }, '*');
+        }, { once: true });
+        frame.srcdoc = getOfflineDecoderDoc();
+      } else {
+        box.querySelector('.tx-preview-link').href = decoderUrl(hex, false);
+        frame.src = decoderUrl(hex, true);
+      }
       const body = box.querySelector('.tx-preview-body');
       const chevron = box.querySelector('.tx-preview-chevron');
       if (info.nIn > PREVIEW_OPEN_MAX_INPUTS) {
@@ -2626,8 +2699,13 @@
 
     document.getElementById('createPsbt').onclick = async () => {
       try {
-        // Attempt to fetch any missing raw transactions for nonWitnessUtxo
-        await fetchAllNonWitnessUtxos().catch(() => {});
+        // Attempt to fetch any missing raw transactions for nonWitnessUtxo.
+        // Offline build: no network to fetch from -- legacy (P2PKH/nested)
+        // inputs that need nonWitnessUtxo must already carry it (e.g. a PSBT
+        // built elsewhere and uploaded); native segwit inputs are unaffected.
+        if (!window.__OFFLINE_BUILD__) {
+          await fetchAllNonWitnessUtxos().catch(() => {});
+        }
 
         const utxoRows = Array.from(document.querySelectorAll('#utxoContainer [data-utxo]'));
         const utxos = utxoRows.map(row => {
@@ -2931,6 +3009,14 @@
       const witErr = checkFinalTxWitness(finalTxHex);
       if (witErr) return alert('Not broadcasting:\n\n' + witErr);
 
+      if (window.__OFFLINE_BUILD__) {
+        document.getElementById('broadcastResult').innerText =
+          'Offline build: this device has no network access to broadcast with.\n\n' +
+          'Move the transaction to an online device with the Download button or the QR code ' +
+          'above, then broadcast it there (mempool.space, Bitcoin Core, or any node).';
+        return;
+      }
+
       const broadcastUrl = getMempoolBaseUrl() + '/tx';
 
       try {
@@ -2975,6 +3061,50 @@
       link.href = URL.createObjectURL(blob);
       link.download = 'finalized.txn';
       link.click();
+    };
+
+    // Offline hand-off: show the finalized raw transaction as a QR code, the
+    // same BBQr/qr_generator pipeline used for the unsigned PSBT (showQrPsbt
+    // above), so it can be scanned by an online device to broadcast. Button
+    // is only revealed by the offline-init block below; wiring it up
+    // unconditionally here is harmless on the online build (never shown).
+    document.getElementById('showFinalTxQr').onclick = () => {
+      if (!finalTxHex) return;
+      const btn = document.getElementById('showFinalTxQr');
+      const qrDiv = document.getElementById('finalTxQrDisplay');
+
+      if (qrDiv.style.display !== 'none') {
+        qrDiv.style.display = 'none';
+        if (window._finalQrInterval) { clearInterval(window._finalQrInterval); window._finalQrInterval = null; }
+        btn.textContent = 'Show QR Code';
+        return;
+      }
+
+      const raw = Buffer.from(finalTxHex, 'hex');
+      // BBQr type 'T' = raw transaction (vs 'P' for PSBT, used above).
+      const { parts } = splitQRs(new Uint8Array(raw), 'T', { encoding: 'Z', maxVersion: 20 });
+      const qrMatrices = parts.map(data => QRGenerator.generateQR(data, QRGenerator.EC_L));
+
+      qrDiv.style.display = '';
+      btn.textContent = 'Hide QR Code';
+      if (window._finalQrInterval) { clearInterval(window._finalQrInterval); window._finalQrInterval = null; }
+
+      const canvas = document.getElementById('finalTxQrCanvas');
+      const info = document.getElementById('finalTxQrPartInfo');
+
+      if (parts.length === 1) {
+        renderQrToCanvas(qrMatrices[0], canvas, 350);
+        info.textContent = '';
+      } else {
+        let idx = 0;
+        function showNext() {
+          renderQrToCanvas(qrMatrices[idx], canvas, 350);
+          info.textContent = `Part ${idx + 1} of ${parts.length}`;
+          idx = (idx + 1) % parts.length;
+        }
+        showNext();
+        window._finalQrInterval = setInterval(showNext, 250);
+      }
     };
 
     const addInputButton = document.getElementById('addInputButton');
@@ -3140,9 +3270,12 @@
       } else if (mode === 'block') {
         locktimeSummaryEl.textContent = r.error ? 'Block: --'
           : `Block ${r.value}${r.value === tipHeight ? ' (current)' : ''}${future}`;
+        const offlineNote = (window.__OFFLINE_BUILD__ && tipHeight === null)
+          ? ' Offline build: enter the current block height manually, or pick None/Date above.' : '';
         locktimeHintEl.textContent = (tipHeight === null ? 'Current height: unknown. ' : `Current height: ${tipHeight}. `) +
           'Valid from the next block after this height. Default is the current height (anti-fee-sniping).' +
-          (future ? ' This height is in the future: the transaction cannot be broadcast until then.' : '');
+          (future ? ' This height is in the future: the transaction cannot be broadcast until then.' : '') +
+          offlineNote;
       } else {
         locktimeSummaryEl.textContent = r.error ? 'Date: --'
           : `Date ${new Date(r.value * 1000).toLocaleString()}${future}`;
@@ -3165,6 +3298,11 @@
     // Fetches the chain tip height. mempool.space and server.py both answer
     // /blocks/tip/height with a plain integer.
     async function fetchTipHeight({ attempts = 2, timeoutMs = 10000 } = {}) {
+      // Offline build: no chain tip to fetch. tipHeight stays null forever,
+      // which validateLocktime() already treats as "enter one, or choose
+      // None" -- the same error path an unreachable mempool.space produces
+      // today, just guaranteed instead of racing a doomed request.
+      if (window.__OFFLINE_BUILD__) return tipHeight;
       // Only the most recent request may write the result. The page fires a
       // fetch on load (dropdown still at its default) and again when network
       // detection settles; a slow mainnet response arriving after the fast
@@ -3264,8 +3402,12 @@
     });
 
     function updateBroadcastLabel() {
-      const net = document.getElementById('network').value;
       const btn = document.getElementById('broadcastTx');
+      if (window.__OFFLINE_BUILD__) {
+        btn.textContent = 'Copy / download & broadcast from an online device';
+        return;
+      }
+      const net = document.getElementById('network').value;
       if (net === 'regtest' && serverMode) {
         btn.textContent = 'Broadcast via regtest';
       } else if (net === 'testnet') {
@@ -3346,7 +3488,19 @@
       // Update collapsed summary: "~110 sats • Slow (1 sat/vB) | 0.02%"
       const summary = document.getElementById('feeRateSummary');
       if (summary) {
-        if (feeRateSat > 0) {
+        if (window.__OFFLINE_BUILD__) {
+          // No mempool.space to suggest a rate from -- always say so, plus
+          // the computed estimate once a rate is entered.
+          let text = 'offline \u2014 enter fee rate manually';
+          if (feeRateSat > 0) {
+            const feePct = (totalIn > 0 && estFee) ? (estFee / totalIn * 100).toFixed(2) : '';
+            text += ` (${feeRateSat} sat/vB`;
+            if (estFee) text += `, ~${estFee} sats`;
+            if (feePct) text += ` | ${feePct}%`;
+            text += ')';
+          }
+          summary.textContent = text;
+        } else if (feeRateSat > 0) {
           const activeBtn = document.querySelector('.fee-preset.active');
           const speedLabel = activeBtn ? activeBtn.dataset.speed.charAt(0).toUpperCase() + activeBtn.dataset.speed.slice(1) : '';
           const feePct = (totalIn > 0 && estFee) ? (estFee / totalIn * 100).toFixed(2) : '';
@@ -3382,6 +3536,20 @@
     updateStepLayout();
     updateTipAddress();
 
+    // Offline build: UI tweaks that don't fit the per-function guards above.
+    // Everything here is additive DOM the online page also ships (hidden by
+    // default) -- see CLAUDE.md's Offline build section for the full list of
+    // guarded behaviors this pairs with.
+    if (window.__OFFLINE_BUILD__) {
+      document.getElementById('offlineBadge').style.display = '';
+      document.getElementById('utxoFetchGroup').style.display = 'none';
+      document.getElementById('offlineFetchHint').style.display = '';
+      document.getElementById('feePresets').style.display = 'none';
+      if (!document.getElementById('feeRate').value) document.getElementById('feeRate').value = '1';
+      updateFeeCalc();
+      document.getElementById('showFinalTxQr').style.display = '';
+    }
+
     // Test hook — expose internal functions for automated testing
     if (window.__TEST_MODE__) {
       window._fn = {
@@ -3416,7 +3584,7 @@
         isWitnessProgramScript, checkPsbtFinalizedInputs, checkFinalTxWitness,
         rowScriptsByOutpoint, looksLikeAccountPath,
         // Transaction preview (PSBT Decoder)
-        renderTxPreview, renderFinalPreview, txPreviewInfo, decoderUrl,
+        renderTxPreview, renderFinalPreview, txPreviewInfo, decoderUrl, getOfflineDecoderDoc,
         get PSBT_DECODER_URL() { return PSBT_DECODER_URL; },
         get PREVIEW_OPEN_MAX_INPUTS() { return PREVIEW_OPEN_MAX_INPUTS; },
         set finalPsbt(v) { finalPsbt = v; },
