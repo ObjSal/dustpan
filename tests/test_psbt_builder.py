@@ -18,6 +18,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -2980,6 +2981,129 @@ def run_tests(page, base_url):
     test("tools/qr-scanner.html: window.jsQR is a function", jsqr_type == "function", jsqr_type)
     qr_non_local = [u for u in qr_seen if "127.0.0.1" not in u and "localhost" not in u]
     test("tools/qr-scanner.html: no external requests", qr_non_local == [], f"{qr_non_local}")
+
+    # ========================================================
+    section("47. Offline build (tools/build-offline.py)")
+    # ========================================================
+    # The real Tails scenario: Tor Browser there can't reach localhost, can't
+    # install a PWA, and blocks ES modules over file:// if they `import`
+    # anything (index.html's module doesn't -- see CLAUDE.md). The offline
+    # deliverable is ONE self-contained HTML file. Build it fresh here, load
+    # it via file:// (not http://) in a real browser, and drive it like a
+    # user on Tails would. Requires psbt-decoder/ (git submodule) checked out.
+
+    offline_html_path = os.path.join(_PROJECT_ROOT, "dist", "dustpan-offline.html")
+    build_proc = subprocess.run(
+        [sys.executable, os.path.join(_PROJECT_ROOT, "tools", "build-offline.py")],
+        cwd=_PROJECT_ROOT, capture_output=True, text=True)
+    test("offline build: tools/build-offline.py exits 0", build_proc.returncode == 0,
+         f"stdout={build_proc.stdout}\nstderr={build_proc.stderr}")
+    test("offline build: self-check passed",
+         "self-check passed" in build_proc.stdout, build_proc.stdout)
+    test("offline build: output file written", os.path.isfile(offline_html_path), offline_html_path)
+
+    offline_url = "file://" + offline_html_path
+    offline_requests = []
+    offline_page_errors = []
+    offline_page = page.context.new_page()
+    offline_page.add_init_script("window.__TEST_MODE__ = true;")
+    offline_page.on("request", lambda req: offline_requests.append(req.url))
+    offline_page.on("pageerror", lambda exc: offline_page_errors.append(str(exc)))
+
+    offline_page.goto(offline_url)
+    offline_page.wait_for_function("() => window._fn !== undefined", timeout=15000)
+
+    # --- (a) zero requests at load: file:// serves exactly the one file,
+    #     nothing else -- no CDN, no vendor/deps.js, no psbt-decoder/, no
+    #     /api/health probe, no mempool.space fee/tip fetch. ---
+    non_primary = [r for r in offline_requests if r != offline_url]
+    test("offline: zero non-primary requests at load", non_primary == [], f"{non_primary}")
+    test("offline: no page errors at load", offline_page_errors == [], f"{offline_page_errors}")
+
+    # --- (b) window.__vendor + test hook present ---
+    test("offline: window.__vendor exists", offline_page.evaluate("() => !!window.__vendor") is True)
+    test("offline: window.__OFFLINE_BUILD__ is true", offline_page.evaluate("() => window.__OFFLINE_BUILD__") is True)
+    test("offline: window._fn test hook present", offline_page.evaluate("() => typeof window._fn === 'object'"))
+    test("offline: network defaults to mainnet (no /api/health probe)",
+         offline_page.evaluate("() => document.getElementById('network').value") == "mainnet")
+    test("offline: networkDetected still resolves", offline_page.evaluate("() => window._fn.networkDetected") is True)
+
+    # --- (c) fetch UI hidden, hint shown, OFFLINE badge visible ---
+    test("offline: fetch/UTXO row hidden",
+         offline_page.evaluate("() => getComputedStyle(document.getElementById('utxoFetchGroup')).display") == "none")
+    test("offline: manual-entry hint shown in its place",
+         offline_page.evaluate("() => getComputedStyle(document.getElementById('offlineFetchHint')).display") != "none")
+    test("offline: OFFLINE badge visible",
+         offline_page.evaluate("() => getComputedStyle(document.getElementById('offlineBadge')).display") != "none")
+
+    # --- fee rate: manual-only, defaulted, and the summary says so ---
+    test("offline: fee-rate presets hidden (no mempool.space to suggest from)",
+         offline_page.evaluate("() => getComputedStyle(document.getElementById('feePresets')).display") == "none")
+    test("offline: fee rate defaults to 1 sat/vB",
+         offline_page.evaluate("() => document.getElementById('feeRate').value") == "1")
+    fee_summary = offline_page.evaluate("() => document.getElementById('feeRateSummary').textContent")
+    test("offline: fee-rate summary notes manual entry", "offline" in fee_summary.lower(), fee_summary)
+
+    # --- locktime: no tip fetch, Block mode default with an empty field
+    #     errors exactly as it does online when mempool.space is unreachable
+    #     (tipHeight just never leaves null instead of racing a request) ---
+    test("offline: locktime mode defaults to block", offline_page.evaluate("() => window._fn.getLocktimeMode()") == "block")
+    lt = offline_page.evaluate("() => window._fn.validateLocktime()")
+    test("offline: Block mode + empty height field errors (no tip was ever fetched)",
+         isinstance(lt, dict) and "unknown" in lt.get("error", ""), lt)
+
+    # --- (d) end-to-end offline flow: manual input + output, locktime None,
+    #     Create PSBT succeeds and the PSBT hex appears ---
+    offline_page.evaluate("() => document.getElementById('utxoContainer').innerHTML = ''")
+    offline_page.evaluate("() => document.getElementById('outputContainer').innerHTML = ''")
+    offline_page.evaluate(f"""() => {{
+        window._fn.addInput(null, "{FAKE_TXID}", 0, 100000, "{P2WPKH_SCRIPT}");
+        window._fn.addOutput(null, "{MAINNET_P2WPKH}", 90000);
+    }}""")
+    # No tip: keep this a plain 1-in/1-out sweep so the preview summary below
+    # is unambiguous (a default 0.99% tip preset would add a second output).
+    offline_page.evaluate("""() => {
+        document.querySelectorAll('.tip-preset').forEach(b => b.classList.remove('active'));
+        document.querySelector('.tip-preset[data-pct="0"]').classList.add('active');
+        document.getElementById('tipSats').value = '';
+    }""")
+    offline_page.fill("#feeRate", "1")
+    offline_page.evaluate("() => window._fn.setLocktimeMode('none')")
+    offline_page.evaluate("() => { document.getElementById('softwareSignerOverride').checked = true; }")
+    offline_page.click("#createPsbt")
+    offline_page.wait_for_selector("#psbtResult", state="visible", timeout=8000)
+    offline_psbt_hex = offline_page.text_content("#psbtHex")
+    test("offline: PSBT created, hex present", offline_psbt_hex.startswith("70736274ff"), offline_psbt_hex[:20])
+
+    # --- (e) srcdoc preview: composed from the psbt-decoder submodule at
+    #     build time, driven by postMessage instead of a URL #fragment,
+    #     renders and reports its height back exactly like the online embed ---
+    try:
+        offline_page.wait_for_function(
+            "() => (document.querySelector('#psbtPreview .tx-preview-frame').style.height || '').endsWith('px')",
+            timeout=15000)
+        offline_preview_loaded = True
+    except Exception:
+        offline_preview_loaded = False
+    offline_preview_height = offline_page.evaluate(
+        "() => document.querySelector('#psbtPreview .tx-preview-frame').style.height")
+    test("offline: transaction preview (embedded decoder) rendered and reported its height",
+         offline_preview_loaded, f"height={offline_preview_height!r}")
+    offline_sandbox = offline_page.evaluate(
+        "() => document.querySelector('#psbtPreview .tx-preview-frame').getAttribute('sandbox')")
+    test("offline: preview iframe sandbox is allow-scripts only (no allow-same-origin, no allow-popups)",
+         offline_sandbox == "allow-scripts", offline_sandbox)
+    offline_summary = offline_page.evaluate(
+        "() => document.querySelector('#psbtPreview .tx-preview-summary').textContent")
+    test("offline: preview summary shows counts", offline_summary == "1 input → 1 output", offline_summary)
+
+    # Nothing above -- Create, the srcdoc assignment, or the postMessage
+    # round trip -- fired a single network request.
+    non_primary_after = [r for r in offline_requests if r != offline_url]
+    test("offline: still zero non-primary requests after the full create+preview flow",
+         non_primary_after == [], f"{non_primary_after}")
+
+    offline_page.close()
 
 
 # ============================================================
