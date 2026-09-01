@@ -96,6 +96,34 @@ gpg --verify dustpan-offline.html.asc dustpan-offline.html  # authenticity, if y
 
 **What's different offline:** an **OFFLINE** badge appears next to the title; the network defaults to Mainnet with no server probe; the "Fetch Unspent" row is replaced with a hint to add inputs manually (`+ Add Input`: txid/vout/value/scriptPubKey) or build the PSBT elsewhere and sign it here; the fee rate is manual-only (defaults to 1 sat/vB); lock time still defaults to Block mode but you type the current height yourself (no tip-height fetch); and the Broadcast step drops the mempool.space POST for a QR code of the raw transaction (BBQr, same pipeline as PSBT display) plus the existing Download button, so you can move the finished transaction to any online device to actually broadcast it. Manual UTXO/output entry, WIF signing, and PSBT upload/scan/combine all keep working exactly as online -- they never needed a network. See `CLAUDE.md`'s "Offline build (Tails)" architecture notes for the guard-by-guard breakdown.
 
+#### Example 1 -- sweep a paper wallet, fully air-gapped (the WIF never touches an online machine)
+
+On any **online** device (phone is fine), using a block explorer or your own node, write down for each UTXO you're sweeping:
+
+- `txid` and `vout` (output index)
+- value in **sats**
+- the address's `scriptPubKey` hex (explorers show it on the transaction's output; for a native-SegWit `bc1q...` address it looks like `0014<20-byte-hash>`)
+- the current **block height** and a reasonable **fee rate** (sat/vB)
+
+On **Tails**, open `dustpan-offline.html`:
+
+1. `+ Add Input` -- paste txid / vout / value / scriptPubKey; expand the input's **WIF** field and paste the private key (a ✔️ appears on the toggle when it parses).
+2. Repeat for each UTXO. Add your destination address as an output and tick **Wipe** to sweep everything after fees (or enter amounts manually).
+3. Set the **Fee Rate** you noted; under **Lock Time**, type the block height you noted (or choose *None*).
+4. When every input has a WIF, the button reads **Create, Sign & Finalize** -- click it. You land on the Broadcast step with the finished transaction as a QR code and a **Download Transaction** (`.txn`) button. Check the Transaction Preview before moving on.
+5. Broadcast from any online device: scan the QR (or carry the `.txn` file out on the USB stick) and paste the hex into mempool.space's *Broadcast Transaction* page, or run `bitcoin-cli sendrawtransaction <hex>` on your node. The private key stayed on Tails the whole time.
+
+#### Example 2 -- build the PSBT on Tails, sign it with another wallet
+
+Use this when the keys live in a hardware or software wallet rather than on paper. Because there's no network, you type the UTXO details exactly as in Example 1, but leave the WIF field empty:
+
+1. Add the inputs manually (txid / vout / value / scriptPubKey). For a signer that matches inputs by key origin (e.g. a hardware wallet), also fill the input's fingerprint / derivation path / pubkey fields; for a signer that matches by address (Bitcoin Core's `walletprocesspsbt`, Sparrow or Electrum with the keys loaded), tick the **"Inputs with no private key and no key origin will be signed by a software wallet..."** checkbox instead.
+2. Add outputs, fee rate, and lock time as above, then click **Create PSBT**. Show the PSBT as an animated QR (**Show QR Code**) or download the `.psbt` file to the USB stick.
+3. Sign it in the other wallet (e.g. a Coldcard Q scans the QR directly; Sparrow opens the file). Bring the signed PSBT back the same way -- the Broadcast step's upload section accepts files and scans QR codes, including multi-part BBQr.
+4. Click **Combine & Finalize**, verify the Transaction Preview, and hand the finished transaction out via QR or `.txn` exactly as in Example 1. Mixed sweeps work too: rows that *do* have a WIF are signed in the page automatically at the combine step.
+
+**Tip for both flows:** double-check the scriptPubKey you typed -- an input whose script doesn't match its address simply can't be signed, and offline there's no fetch step to catch the typo for you. The Transaction Preview on both steps shows amounts, addresses, and the fee before anything leaves the page.
+
 ## Testing
 
 ```bash
