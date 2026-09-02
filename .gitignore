@@ -151,5 +151,8 @@ tests/_logs/
 # guard against __pycache__ from running the tools/ scripts directly)
 tools/__pycache__/
 
+# test_connect_mode.py imports server/server.py as a module (RegtestNode)
+server/__pycache__/
+
 # tools/build-offline.py output (dustpan-offline.html + .sha256) -- built, not committed
 dist/

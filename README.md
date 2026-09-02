@@ -49,6 +49,7 @@ Both approaches work through the same Combine & Finalize step.
 - **No server required** -- runs entirely in the browser on GitHub Pages
 - **Offline build for Tails** -- `tools/build-offline.py` produces one self-contained `dustpan-offline.html` for `file://` use with no server and no network calls (see [Offline build (Tails)](#offline-build-tails) below)
 - **Regtest mode** with a local Python server for development and testing
+- **Connect-bridge mode** -- point `server/server.py --connect` at a bitcoind you already run (any chain) with no address index required, so node-runners without electrs can still fetch UTXOs, fees, and broadcast without leaving their own node (see [Bridge a bare bitcoind](#bridge-a-bare-bitcoind) above)
 
 ## Usage
 
@@ -140,6 +141,35 @@ Every other endpoint (`/address/:addr/utxo`, `/tx/:txid/hex`, `POST /tx`, `/bloc
 
 **Tails / offline build:** this feature only makes sense for the **online** build on a normal desktop browser. Tor Browser on Tails can't reach `localhost` at all, and the offline build's CSP is `connect-src 'none'` -- no network request can succeed from it, custom backend or otherwise -- so the whole Backend section is hidden there.
 
+### Bridge a bare bitcoind
+
+Already run `bitcoind` but don't have an address index (electrs/Fulcrum) in front of it? `server/server.py` can bridge it directly -- no address index needed, at the cost of slow, history-less UTXO lookups (see below). If you *do* have electrs or a similar esplora-compatible index running, use [Custom backend](#use-your-own-node) instead -- it's instant and this bridge has no reason to exist for you.
+
+```bash
+# Cookie-file auth (default: bitcoind's own datadir for the detected chain --
+# macOS ~/Library/Application Support/Bitcoin, Linux ~/.bitcoin; regtest/
+# testnet4 subdirs). Chain is auto-detected via getblockchaininfo.
+python3 server/server.py 8000 --connect
+
+# A remote or non-default node, and/or explicit rpcuser/rpcpassword auth
+python3 server/server.py 8000 --connect 192.168.1.50:8332 \
+  --rpcuser youruser --rpcpassword yourpassword
+
+# Explicit cookie file and chain (skips the chain-detection probe)
+python3 server/server.py 8000 --connect --chain testnet4 \
+  --rpccookie ~/.bitcoin/testnet4/.cookie
+```
+
+Then open `http://localhost:8000/index.html` -- the frontend detects the bridge via `/api/health` (`mode: "connect"`) and auto-selects the bridged chain's network, same as `--regtest` auto-selects regtest.
+
+**How it differs from `--regtest`:** nothing is spawned, owned, faucet-funded, or auto-mined -- this mode only ever runs read-only-ish RPCs (`getblockchaininfo`, `getblockcount`, `getrawtransaction`, `estimatesmartfee`, `scantxoutset`) plus `sendrawtransaction` for the one broadcast you ask for. `/api/faucet` and `/api/mine` are refused with a clear error, exactly as they are on a plain static server.
+
+**UTXO lookups are slow -- read this before pointing it at mainnet.** Without an address index, `/address/:addr/utxo` runs `scantxoutset`, which walks the **entire UTXO set** on every call. On regtest/testnet4 this is fast; on mainnet the *first* lookup for an address can take several **minutes**. The frontend raises its fetch timeout to 10 minutes in this mode and shows a "scanning the node's UTXO set" status line while it waits, and the bridge caches each address's result for 60 seconds so retries and page reloads don't repeat the scan. There's no history either -- `scantxoutset` only sees the current UTXO set, so already-spent outputs never show up (irrelevant for sweeping, since you only care about what's spendable now).
+
+**mainnet/testnet4 `/tx/:txid/hex` needs `txindex=1`.** Without it, `getrawtransaction` only finds your own wallet's transactions and anything currently in the mempool -- an arbitrary confirmed txid from someone else's transaction will 404. `nonWitnessUtxo` lookups for non-segwit inputs need this; native segwit and taproot inputs don't need it.
+
+**Tails / offline build:** same as [Custom backend](#use-your-own-node) -- this is a normal-desktop-browser feature. Tor Browser on Tails cannot reach `localhost` at all, so `--connect` (like `--regtest`) is never reachable from a Tails session; use the [offline build](#offline-build-tails) there instead.
+
 ## Testing
 
 ```bash
@@ -148,7 +178,7 @@ python3 tests/run_all.py             # everything that runs locally
 python3 tests/run_all.py --testnet4  # + the two real-testnet4 Coldcard suites
 python3 tests/run_all.py --list      # show the plan / skip reasons
 
-# Unit tests -- index.html, 428 tests, no bitcoind needed (~45s)
+# Unit tests -- index.html, 443 tests, no bitcoind needed (~45s)
 # Includes building and driving the offline (Tails) single-file build via file://
 python3 tests/test_psbt_builder.py
 
@@ -161,6 +191,12 @@ python3 tests/test_core_tx_comparison.py
 # Covers P2WPKH + P2TR (Taproot), parallel + serial signing,
 # WIF fetch + inline signing, and mixed WIF partial signing
 python3 tests/test_regtest_e2e.py
+
+# Connect-bridge tests -- 38 tests, requires bitcoind + bitcoin-cli (~30s)
+# Bridges a regtest node server.py did NOT spawn (server/server.py --connect);
+# health/tip/UTXO/fee/broadcast endpoints, cache TTL, faucet/mine refusal,
+# and one browser pass proving network auto-select + UI fetch through it
+python3 tests/test_connect_mode.py
 
 # Coldcard simulation tests -- 43 tests, requires bitcoind + embit (~120s)
 # Simulates Coldcard signing via bitcoin-cli walletprocesspsbt

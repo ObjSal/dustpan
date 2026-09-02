@@ -3390,6 +3390,100 @@ def run_tests(page, base_url):
     clear_backend_overrides()
     page.select_option("#network", "mainnet")
 
+    # ========================================================
+    section("50. Connect-bridge health contract (server/server.py --connect)")
+    # ========================================================
+    # server/server.py now reports a 'mode' in /api/health: 'static' | 'regtest'
+    # | 'connect'. Plain static mode (no --regtest, no --connect) must NOT flip
+    # the frontend into serverMode -- that used to be implied by "no /api/health
+    # at all", but a static server can now answer health too. Connect mode
+    # auto-selects the network from the bridged chain instead of always regtest.
+
+    def _connect_health_page(health_body):
+        """A fresh page with /api/health stubbed to health_body (a dict),
+        the usual tip/fee/tx stubs so load doesn't hang on mempool.space, and
+        window._fn ready."""
+        p = page.context.new_page()
+        p.add_init_script("window.__TEST_MODE__ = true;")
+        p.route("**/api/health", lambda route, req: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(health_body)))
+        p.route("**/blocks/tip/height",
+                lambda route, req: route.fulfill(status=200, content_type="text/plain", body="900000"))
+        p.route("**/api/tx/*/hex", lambda route, req: route.fulfill(status=404, body="Transaction not found"))
+        p.route("**/v1/fees/recommended", lambda route, req: route.fulfill(
+            status=200, content_type="application/json",
+            body='{"fastestFee":3,"halfHourFee":2,"hourFee":1,"economyFee":1,"minimumFee":1}'))
+        p.goto(base_url)
+        p.wait_for_function("() => window._fn !== undefined", timeout=15000)
+        p.wait_for_function("() => window._fn.networkDetected === true", timeout=15000)
+        return p
+
+    # --- static-mode health (mode: 'static') does not enable serverMode;
+    #     network detection falls through to the localhost default (testnet) ---
+    static_page = _connect_health_page({"status": "ok", "mode": "static", "regtest": False, "chain": None})
+    test("connect-health: static mode -> serverMode false",
+         static_page.evaluate("() => window._fn.serverMode") is False)
+    test("connect-health: static mode -> serverConnectMode false",
+         static_page.evaluate("() => window._fn.serverConnectMode") is False)
+    static_net = static_page.evaluate("() => document.getElementById('network').value")
+    test("connect-health: static mode -> network falls through to localhost default (testnet)",
+         static_net == "testnet", static_net)
+    static_page.close()
+
+    # --- legacy health (no 'mode', just 'regtest': true) still treated as regtest ---
+    legacy_page = _connect_health_page({"status": "ok", "regtest": True, "rpc_port": 18443})
+    test("connect-health: legacy 'regtest: true' (no mode) -> serverMode true",
+         legacy_page.evaluate("() => window._fn.serverMode") is True)
+    test("connect-health: legacy 'regtest: true' (no mode) -> serverConnectMode false",
+         legacy_page.evaluate("() => window._fn.serverConnectMode") is False)
+    legacy_net = legacy_page.evaluate("() => document.getElementById('network').value")
+    test("connect-health: legacy 'regtest: true' -> network selects regtest",
+         legacy_net == "regtest", legacy_net)
+    legacy_page.close()
+
+    # --- connect-mode health auto-selects the mapped network from 'chain' ---
+    connect_page = _connect_health_page({"status": "ok", "mode": "connect", "regtest": False,
+                                         "chain": "testnet4", "rpc_host": "127.0.0.1", "rpc_port": 48332})
+    test("connect-health: connect mode -> serverMode true",
+         connect_page.evaluate("() => window._fn.serverMode") is True)
+    test("connect-health: connect mode -> serverConnectMode true",
+         connect_page.evaluate("() => window._fn.serverConnectMode") is True)
+    connect_net = connect_page.evaluate("() => document.getElementById('network').value")
+    test("connect-health: connect mode chain=testnet4 -> network auto-selects testnet",
+         connect_net == "testnet", connect_net)
+    test("connect-health: connect mode -> UTXO fetch timeout raised to 10 minutes",
+         connect_page.evaluate("() => window._fn.utxoFetchTimeoutMs()") == 600000)
+    connect_page.close()
+
+    # --- connect mode chain=regtest -> network selects regtest ---
+    connect_regtest_page = _connect_health_page({"status": "ok", "mode": "connect", "regtest": False,
+                                                 "chain": "regtest", "rpc_host": "127.0.0.1", "rpc_port": 18443})
+    connect_regtest_net = connect_regtest_page.evaluate("() => document.getElementById('network').value")
+    test("connect-health: connect mode chain=regtest -> network auto-selects regtest",
+         connect_regtest_net == "regtest", connect_regtest_net)
+    connect_regtest_page.close()
+
+    # --- connect mode chain=mainnet -> network selects mainnet ---
+    connect_mainnet_page = _connect_health_page({"status": "ok", "mode": "connect", "regtest": False,
+                                                 "chain": "mainnet", "rpc_host": "127.0.0.1", "rpc_port": 8332})
+    connect_mainnet_net = connect_mainnet_page.evaluate("() => document.getElementById('network').value")
+    test("connect-health: connect mode chain=mainnet -> network auto-selects mainnet",
+         connect_mainnet_net == "mainnet", connect_mainnet_net)
+    connect_mainnet_page.close()
+
+    # --- regtest-spawn mode (mode: 'regtest') behaves exactly as before:
+    #     serverMode true, serverConnectMode false, timeout unchanged ---
+    regtest_page = _connect_health_page({"status": "ok", "mode": "regtest", "regtest": True,
+                                         "rpc_port": 18443, "datadir": "/tmp/x"})
+    test("connect-health: regtest mode -> serverMode true, serverConnectMode false",
+         regtest_page.evaluate("() => window._fn.serverMode") is True
+         and regtest_page.evaluate("() => window._fn.serverConnectMode") is False)
+    test("connect-health: regtest mode -> network selects regtest",
+         regtest_page.evaluate("() => document.getElementById('network').value") == "regtest")
+    test("connect-health: regtest mode -> UTXO fetch timeout unchanged (15s)",
+         regtest_page.evaluate("() => window._fn.utxoFetchTimeoutMs()") == 15000)
+    regtest_page.close()
+
 
 # ============================================================
 # Main
