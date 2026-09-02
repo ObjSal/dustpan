@@ -376,12 +376,20 @@
     }
 
     // Detect local server mode and auto-select network:
-    // - Regtest server (/api/health responds) → regtest
-    // - Static server (localhost, no /api/health) → testnet4
+    // - Regtest server (/api/health mode:'regtest') → regtest
+    // - Connect bridge (/api/health mode:'connect') → the bridged chain
+    // - Static server (localhost, no /api/health, or mode:'static') → testnet4
     // - GitHub Pages (not localhost) → mainnet
     let serverMode = false;
+    // True only when the local server is bridging an EXISTING bitcoind
+    // (server/server.py --connect) rather than a spawned regtest node --
+    // scantxoutset there can take minutes, so fetches need a longer timeout.
+    let serverConnectMode = false;
     let networkDetected = false;  // true once detectServer() has set #network
     const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
+    // /api/health's 'chain' (server/server.py --connect mode) -> this page's
+    // network dropdown values.
+    const CONNECT_CHAIN_TO_NETWORK = { mainnet: 'mainnet', testnet4: 'testnet', regtest: 'regtest' };
     (async function detectServer() {
       // Offline build: no server can ever answer, and the file:// origin
       // can't make the request anyway -- skip it outright rather than
@@ -399,14 +407,26 @@
         networkDetected = true;
         return;
       }
+      let mode = null;
+      let chain = null;
       try {
         const resp = await fetch('/api/health', { signal: AbortSignal.timeout(2000) });
         const data = await resp.json();
-        serverMode = data.status === 'ok';
-      } catch { serverMode = false; }
+        if (data.status === 'ok') {
+          // 'mode' is the current health contract (static/regtest/connect).
+          // A legacy response carrying only 'regtest: true' (no 'mode') is
+          // treated as regtest, same as before.
+          mode = data.mode || (data.regtest ? 'regtest' : 'static');
+          chain = data.chain || null;
+        }
+      } catch { mode = null; }
+      serverMode = mode === 'regtest' || mode === 'connect';
+      serverConnectMode = mode === 'connect';
 
       const networkEl = document.getElementById('network');
-      if (serverMode) {
+      if (serverConnectMode && CONNECT_CHAIN_TO_NETWORK[chain]) {
+        networkEl.value = CONNECT_CHAIN_TO_NETWORK[chain];
+      } else if (serverMode) {
         networkEl.value = 'regtest';
       } else if (isLocalhost) {
         networkEl.value = 'testnet';
@@ -421,6 +441,15 @@
       if (typeof updateBroadcastLabel === 'function') updateBroadcastLabel();
       networkDetected = true;
     })();
+
+    // scantxoutset (server/server.py --connect) is synchronous and can take
+    // MINUTES against a mainnet node's full UTXO set; the regular ~15s
+    // address-fetch timeout only applies otherwise.
+    function utxoFetchTimeoutMs() {
+      return serverConnectMode ? 600000 : 15000;
+    }
+    const CONNECT_SCAN_STATUS_HINT =
+      ' (scanning the node’s UTXO set — first lookup can take minutes on mainnet)';
 
     // Cache of txid → full raw transaction hex (for nonWitnessUtxo)
     const rawTxCache = new Map();
@@ -702,11 +731,11 @@
 
       if (!validateBitcoinAddress(address, net)) { statusEl.textContent = 'Invalid address for selected network.'; return; }
 
-      statusEl.textContent = 'Fetching UTXOs...';
+      statusEl.textContent = 'Fetching UTXOs...' + (serverConnectMode ? CONNECT_SCAN_STATUS_HINT : '');
 
       try {
         const base = getMempoolBaseUrl();
-        const resp = await fetch(`${base}/address/${address}/utxo`, { signal: AbortSignal.timeout(15000) });
+        const resp = await fetch(`${base}/address/${address}/utxo`, { signal: AbortSignal.timeout(utxoFetchTimeoutMs()) });
         if (!resp.ok) throw new Error(`API error: ${resp.status}`);
         const utxos = await resp.json();
 
@@ -957,10 +986,11 @@
         const BATCH = 5, DELAY = 200;
         const found = [], empty = [];
         for (let i = 0; i < entries.length; i += BATCH) {
-          go.textContent = `Checking ${Math.min(i + BATCH, entries.length)}/${entries.length}…`;
+          go.textContent = `Checking ${Math.min(i + BATCH, entries.length)}/${entries.length}…`
+            + (serverConnectMode ? CONNECT_SCAN_STATUS_HINT : '');
           const batch = entries.slice(i, i + BATCH);
           const responses = await Promise.allSettled(batch.map(e =>
-            fetch(`${base}/address/${e.address}/utxo`, { signal: AbortSignal.timeout(15000) })
+            fetch(`${base}/address/${e.address}/utxo`, { signal: AbortSignal.timeout(utxoFetchTimeoutMs()) })
               .then(r => r.ok ? r.json() : Promise.reject(new Error(`API error: ${r.status}`)))));
           responses.forEach((r, j) => {
             const e = batch[j];
@@ -1067,8 +1097,8 @@
         const allTxids = new Set();
 
         for (const { addr, type } of addresses) {
-          statusEl.textContent = `Fetching ${type} UTXOs...`;
-          const resp = await fetch(`${base}/address/${addr}/utxo`, { signal: AbortSignal.timeout(15000) });
+          statusEl.textContent = `Fetching ${type} UTXOs...` + (serverConnectMode ? CONNECT_SCAN_STATUS_HINT : '');
+          const resp = await fetch(`${base}/address/${addr}/utxo`, { signal: AbortSignal.timeout(utxoFetchTimeoutMs()) });
           if (!resp.ok) throw new Error(`API error: ${resp.status}`);
           const utxos = await resp.json();
 
@@ -3337,6 +3367,9 @@
         get finalTxHex() { return finalTxHex; },
         get serverMode() { return serverMode; },
         set serverMode(v) { serverMode = v; },
+        get serverConnectMode() { return serverConnectMode; },
+        set serverConnectMode(v) { serverConnectMode = v; },
+        utxoFetchTimeoutMs,
         get networkDetected() { return networkDetected; },
         // Custom backend
         getBackendOverride, setBackendOverride, validateBackendOrigin,

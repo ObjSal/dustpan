@@ -24,6 +24,7 @@ Encoded knowledge:
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -122,6 +123,8 @@ def build_plan(args):
     decoder_dir = os.path.join(_ROOT, "psbt-decoder")
     decoder_skip = None if os.path.isfile(os.path.join(decoder_dir, "test", "test-psbt.js")) \
         else "psbt-decoder submodule not initialized (git submodule update --init)"
+    connect_skip = None if (shutil.which("bitcoind") and shutil.which("bitcoin-cli")) \
+        else "bitcoind/bitcoin-cli not found in PATH"
 
     suites = {
         "unit": Suite("unit", [py, t("test_psbt_builder.py")], timeout=900),
@@ -131,6 +134,8 @@ def build_plan(args):
                          "cd psbt-decoder && for f in test/test-*.js; do node $f || exit 1; done"],
                          skip_reason=decoder_skip, timeout=300, needs_results=False),
         "e2e": Suite("e2e", [py, t("test_regtest_e2e.py")], timeout=900),
+        "connect": Suite("connect", [py, t("test_connect_mode.py")],
+                         skip_reason=connect_skip, timeout=600),
         "cc-sim": Suite("cc-sim", [py, t("test_coldcard_simulation.py")], timeout=900),
         "cc-regtest": Suite("cc-regtest", [py, t("_test_coldcard_regtest.py")],
                             skip_reason=cc_skip, timeout=900),
@@ -144,6 +149,7 @@ def build_plan(args):
     phases = [
         ("parallel: static server + Pi node + node", ["unit", "comparison", "decoder"]),
         ("local bitcoind (after the Pi comparison)", ["e2e"]),
+        ("local bitcoind", ["connect"]),
         ("local bitcoind", ["cc-sim"]),
         ("Coldcard simulator, sequential", ["cc-regtest"]),
         ("Coldcard simulator + real testnet4, sequential", ["cc-testnet4"]),
