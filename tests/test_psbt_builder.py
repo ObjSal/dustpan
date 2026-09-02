@@ -3035,6 +3035,8 @@ def run_tests(page, base_url):
          offline_page.evaluate("() => getComputedStyle(document.getElementById('offlineFetchHint')).display") != "none")
     test("offline: OFFLINE badge visible",
          offline_page.evaluate("() => getComputedStyle(document.getElementById('offlineBadge')).display") != "none")
+    test("offline: Backend section hidden (Tor Browser can't reach localhost; CSP is connect-src 'none')",
+         offline_page.evaluate("() => getComputedStyle(document.getElementById('backendGroup')).display") == "none")
 
     # --- fee rate: manual-only, defaulted, and the summary says so ---
     test("offline: fee-rate presets hidden (no mempool.space to suggest from)",
@@ -3186,6 +3188,207 @@ def run_tests(page, base_url):
          csp_page.evaluate("() => typeof window._fn === 'object'"))
 
     csp_page.close()
+
+    # ========================================================
+    section("49. Custom Backend (point a network at your own esplora-compatible node)")
+    # ========================================================
+    # Privacy: let a user route one network's mempool.space-shaped calls to
+    # their own electrs/Fulcrum-backed/esplora instance instead, without
+    # loosening the CSP beyond the four localhost entries it now carries.
+
+    def clear_backend_overrides():
+        page.evaluate("""() => {
+            ['mainnet', 'testnet', 'regtest'].forEach(n => window._fn.setBackendOverride(n, null));
+        }""")
+
+    clear_backend_overrides()
+
+    # --- default (no override) behaviour is byte-identical to before ---
+    # (section 2b above pins the three literal default URLs; this just
+    # re-confirms an override-aware getMempoolBaseUrl() still produces them
+    # when nothing is saved.)
+    page.select_option("#network", "mainnet")
+    result = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    test("Custom backend: no override -> default mainnet URL unchanged",
+         result == "https://mempool.space/api", f"got {result}")
+
+    # --- override set -> getMempoolBaseUrl() returns it ---
+    page.evaluate("() => window._fn.setBackendOverride('mainnet', 'http://127.0.0.1:19999/api')")
+    result = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    test("Custom backend: override set -> getMempoolBaseUrl returns it",
+         result == "http://127.0.0.1:19999/api", f"got {result}")
+
+    # --- cleared -> default restored ---
+    page.evaluate("() => window._fn.setBackendOverride('mainnet', null)")
+    result = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    test("Custom backend: override cleared -> default restored",
+         result == "https://mempool.space/api", f"got {result}")
+
+    # --- per-network independence ---
+    page.evaluate("""() => {
+        window._fn.setBackendOverride('mainnet', 'http://127.0.0.1:11111/api');
+        window._fn.setBackendOverride('testnet', 'http://127.0.0.1:22222/api');
+    }""")
+    page.select_option("#network", "mainnet")
+    mainnet_url = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    page.select_option("#network", "testnet")
+    testnet_url = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    test("Custom backend: per-network independence",
+         mainnet_url == "http://127.0.0.1:11111/api" and testnet_url == "http://127.0.0.1:22222/api",
+         f"mainnet={mainnet_url} testnet={testnet_url}")
+    clear_backend_overrides()
+
+    # --- regtest+serverMode '/api' precedence, unless an override is set ---
+    page.select_option("#network", "regtest")
+    page.evaluate("() => { window._fn.serverMode = true; }")
+    result = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    test("Custom backend: regtest+serverMode with no override -> '/api' unchanged",
+         result == "/api", f"got {result}")
+    page.evaluate("() => window._fn.setBackendOverride('regtest', 'http://127.0.0.1:33333/api')")
+    result = page.evaluate("() => window._fn.getMempoolBaseUrl()")
+    test("Custom backend: an explicit regtest override beats serverMode's '/api' precedence",
+         result == "http://127.0.0.1:33333/api", f"got {result}")
+    page.evaluate("() => { window._fn.serverMode = false; }")
+    clear_backend_overrides()
+
+    # --- resetAll() leaves the override alone (it's environment config, not
+    #     transaction state) ---
+    page.select_option("#network", "mainnet")
+    page.evaluate("() => window._fn.setBackendOverride('mainnet', 'http://127.0.0.1:55555/api')")
+    page.evaluate("() => window._fn.resetAll()")
+    after_reset = page.evaluate("() => window._fn.getBackendOverride('mainnet')")
+    test("Custom backend: resetAll() does not clear the backend override",
+         after_reset == "http://127.0.0.1:55555/api", f"got {after_reset}")
+    clear_backend_overrides()
+
+    # --- persistence survives reload, and the saved override for the
+    #     detected network is loaded into the input on init ---
+    page.evaluate("() => window._fn.setBackendOverride('testnet', 'http://127.0.0.1:44444/api')")
+    page.reload()
+    page.wait_for_function("() => window._fn !== undefined", timeout=15000)
+    page.wait_for_function("() => window._fn.networkDetected === true", timeout=15000)
+    page.evaluate("() => window._fn.fetchTipHeight()")  # settle the stubbed tip route, as at initial load
+    detected_net = page.evaluate("() => document.getElementById('network').value")
+    persisted = page.evaluate("() => window._fn.getBackendOverride('testnet')")
+    test("Custom backend: override persists across reload",
+         persisted == "http://127.0.0.1:44444/api", f"got {persisted}")
+    if detected_net == "testnet":
+        backend_input_val = page.evaluate("() => document.getElementById('backendUrl').value")
+        test("Custom backend: reload loads the saved override into the input for the detected network",
+             backend_input_val == "http://127.0.0.1:44444/api", f"got {backend_input_val}")
+    clear_backend_overrides()
+    page.select_option("#network", "mainnet")
+
+    # --- origin validation: same-origin / mempool.space / localhost accepted,
+    #     everything else rejected with the why-and-how explanation ---
+    result = page.evaluate("() => window._fn.validateBackendOrigin('https://evil.example/api')")
+    test("Custom backend: third-party origin rejected",
+         bool(result.get("error")), result)
+    err_text = result.get("error", "")
+    test("Custom backend: rejection explains WHY (exfiltration risk) and HOW (tunnel / self-host)",
+         "exfiltrate" in err_text and "ssh -L" in err_text and "same-origin" in err_text.lower(),
+         err_text)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('http://127.0.0.1:3006/api')")
+    test("Custom backend: http://127.0.0.1:<port> accepted",
+         "error" not in result and result.get("url") == "http://127.0.0.1:3006/api", result)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('http://localhost:3006/api')")
+    test("Custom backend: http://localhost:<port> accepted",
+         "error" not in result and result.get("url") == "http://localhost:3006/api", result)
+
+    same_origin_url = base_url.rsplit("/", 1)[0] + "/api/"
+    result = page.evaluate(f"() => window._fn.validateBackendOrigin('{same_origin_url}')")
+    test("Custom backend: same-origin accepted, trailing slash trimmed",
+         "error" not in result and result.get("url") == same_origin_url.rstrip("/"), result)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('https://mempool.space/testnet4/api')")
+    test("Custom backend: https://mempool.space accepted (any path)",
+         "error" not in result and result.get("url") == "https://mempool.space/testnet4/api", result)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('http://mempool.space/api')")
+    test("Custom backend: plain http:// to mempool.space rejected (must be https)",
+         bool(result.get("error")), result)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('http://evil.example:3006/api')")
+    test("Custom backend: non-local http origin (not mempool.space, not localhost) rejected",
+         bool(result.get("error")), result)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('')")
+    test("Custom backend: empty input rejected", bool(result.get("error")), result)
+
+    result = page.evaluate("() => window._fn.validateBackendOrigin('not a url')")
+    test("Custom backend: unparsable input rejected", bool(result.get("error")), result)
+
+    # --- fee fallback chain: /v1/fees/recommended fails -> /fee-estimates
+    #     (stock esplora) succeeds -> synthesized presets ---
+    def fee_404_route(route, request):
+        route.fulfill(status=404, body="not found")
+
+    def fee_estimates_route(route, request):
+        route.fulfill(status=200, content_type="application/json",
+                       body='{"1": 87.882, "2": 60.1, "3": 45.5, "6": 30.2, '
+                            '"144": 5.9, "504": 2.1, "1008": 1.1}')
+
+    page.route("**/v1/fees/recommended", fee_404_route)
+    page.route("**/fee-estimates", fee_estimates_route)
+    page.evaluate("async () => { await window._fn.fetchFeeRates(); }")
+    fast_rate = page.evaluate('() => document.querySelector(\'.fee-preset[data-speed="fast"]\').dataset.rate')
+    med_rate = page.evaluate('() => document.querySelector(\'.fee-preset[data-speed="medium"]\').dataset.rate')
+    slow_rate = page.evaluate('() => document.querySelector(\'.fee-preset[data-speed="slow"]\').dataset.rate')
+    test("Custom backend: fee fallback synthesizes fastestFee = ceil(est[\"1\"])",
+         fast_rate == "88", f"got {fast_rate}")
+    test("Custom backend: fee fallback synthesizes halfHourFee = ceil(est[\"3\"])",
+         med_rate == "46", f"got {med_rate}")
+    test("Custom backend: fee fallback synthesizes hourFee = ceil(est[\"6\"])",
+         slow_rate == "31", f"got {slow_rate}")
+    page.unroute("**/v1/fees/recommended", fee_404_route)
+    page.unroute("**/fee-estimates", fee_estimates_route)
+
+    # --- fee fallback chain: both endpoints fail -> current manual-entry
+    #     failure behaviour (unchanged) ---
+    def fee_500_route(route, request):
+        route.fulfill(status=500, body="err")
+
+    def fee_estimates_500_route(route, request):
+        route.fulfill(status=500, body="err")
+
+    page.route("**/v1/fees/recommended", fee_500_route)
+    page.route("**/fee-estimates", fee_estimates_500_route)
+    page.evaluate("async () => { await window._fn.fetchFeeRates(); }")
+    fast_text = page.evaluate('() => document.querySelector(\'.fee-preset[data-speed="fast"]\').textContent')
+    test("Custom backend: total fee failure falls back to manual entry (N/A), as before",
+         "N/A" in fast_text, fast_text)
+    page.unroute("**/v1/fees/recommended", fee_500_route)
+    page.unroute("**/fee-estimates", fee_estimates_500_route)
+    # Restore normal fee-preset button state (the setup-level 200 stub is
+    # active again now that both temporary handlers above were removed).
+    page.evaluate("async () => { await window._fn.fetchFeeRates(); }")
+
+    # --- static guard: CSP connect-src carries exactly the four localhost
+    #     entries and nothing else new (self + mempool.space were already
+    #     there; a broader grant here would reopen the exfiltration channel
+    #     the CSP exists to close) ---
+    with open(os.path.join(_PROJECT_ROOT, "index.html"), encoding="utf-8") as f:
+        backend_index_html = f.read()
+    csp_meta_match = re.search(
+        r'<meta[^>]*http-equiv="Content-Security-Policy"[^>]*content="([^"]*)"',
+        backend_index_html, re.I)
+    csp_content = csp_meta_match.group(1) if csp_meta_match else ""
+    connect_src_match = re.search(r'connect-src\s+([^;]+);', csp_content)
+    connect_src_tokens = set((connect_src_match.group(1).strip() if connect_src_match else "").split())
+    expected_connect_src = {
+        "'self'", "https://mempool.space",
+        "http://localhost:*", "http://127.0.0.1:*",
+        "https://localhost:*", "https://127.0.0.1:*",
+    }
+    test("index.html: CSP connect-src is exactly self + mempool.space + the four localhost entries "
+         "(guards against future broadening)",
+         connect_src_tokens == expected_connect_src, connect_src_tokens)
+
+    # --- cleanup: leave no overrides behind ---
+    clear_backend_overrides()
+    page.select_option("#network", "mainnet")
 
 
 # ============================================================

@@ -75,7 +75,8 @@ OUT_FILE = DIST_DIR / "dustpan-offline.html"
 
 DONATE_URL = "https://objsal.github.io/dustpan/donate.html"
 
-# index.html's meta CSP (script-src 'self', connect-src limited to mempool.space)
+# index.html's meta CSP (script-src 'self', connect-src limited to mempool.space
+# and localhost/127.0.0.1 -- the custom-backend feature's allowlist, see CLAUDE.md)
 # is right for a page loaded from a server, but wrong once everything is
 # inlined into one static file: 'self' would forbid running the inline
 # <script> blocks this build produces, and the srcdoc decoder iframe (which
@@ -84,7 +85,8 @@ DONATE_URL = "https://objsal.github.io/dustpan/donate.html"
 # statement this build can make, since after inlining there is truly no
 # network resource left to fetch.
 CSP_ONLINE = ("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; "
-              "img-src 'self' data: blob:; connect-src 'self' https://mempool.space; "
+              "img-src 'self' data: blob:; connect-src 'self' https://mempool.space "
+              "http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:*; "
               "frame-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'; "
               "form-action 'none'")
 CSP_OFFLINE = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "

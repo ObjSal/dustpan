@@ -11,7 +11,7 @@
        they differ. NEVER add an inline <script> to this page: script-src
        'self' means it silently would not run -- that is the policy working,
        not a bug; move the code to app.js instead. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://mempool.space; frame-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://mempool.space http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:*; frame-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>Dustpan — Bitcoin Address Sweeper</title>
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
   <style>
@@ -227,6 +227,29 @@
     </select>
     <span style="flex:1;"></span>
     <button type="button" id="donateBtn" class="btn-secondary" style="padding:0.3rem 0.7rem;font-size:0.85rem;margin:0;flex:0 0 auto;width:auto;">&#9749; Donate</button>
+  </div>
+
+  <div id="backendGroup" style="margin-bottom:1rem;">
+    <div style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;justify-content:center;" id="backendToggle">
+      <span style="font-size:0.85rem;color:var(--text-secondary);">Backend:</span>
+      <span id="backendSummary" style="color:var(--text-secondary);font-size:0.85rem;font-weight:bold;"></span>
+      <span id="backendChevron" style="font-size:0.7rem;color:var(--text-secondary);transition:transform 0.2s;transform:rotate(-90deg);">&#9660;</span>
+    </div>
+    <div id="backendBody" style="display:none;max-width:520px;margin:0.5rem auto 0;">
+      <p style="color:var(--text-secondary);font-size:0.78rem;margin:0 0 0.4rem;">
+        Point the <strong>current network</strong> at your own esplora-compatible server (electrs,
+        a self-hosted mempool instance backed by Fulcrum, or Blockstream's esplora) instead of
+        mempool.space, so your addresses never leave your network. Only same-origin, mempool.space,
+        and localhost/127.0.0.1 backends are allowed &mdash; see the README's "Use your own node"
+        section for why and how.
+      </p>
+      <div class="row" style="align-items:center;">
+        <input class="grow" type="text" id="backendUrl" placeholder="e.g. http://127.0.0.1:3006/api">
+        <button type="button" id="backendApply" class="btn-secondary" style="width:auto;flex:0 0 auto;">Apply</button>
+        <button type="button" id="backendResetBtn" class="btn-secondary" style="width:auto;flex:0 0 auto;">Reset</button>
+      </div>
+      <div id="backendStatus" style="font-size:0.8rem;color:var(--text-secondary);margin-top:0.4rem;white-space:pre-line;"></div>
+    </div>
   </div>
 
   <div class="step-indicator" id="stepIndicator">
