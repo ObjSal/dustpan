@@ -464,8 +464,146 @@
       };
     }
 
+    // ---------------- Custom backend (privacy: point a network at your own
+    // node instead of mempool.space) ----------------
+    // Persisted per-network in localStorage so a self-hosted electrs/Fulcrum
+    // choice on regtest doesn't leak onto mainnet or vice versa. Every access
+    // is wrapped in try/catch: private browsing / storage-disabled contexts
+    // throw on localStorage access, and this feature must degrade to "no
+    // override" rather than break the page.
+    const BACKEND_STORAGE_PREFIX = 'dustpan.backend.';
+    function backendStorageKey(net) { return `${BACKEND_STORAGE_PREFIX}${net}`; }
+
+    function getBackendOverride(net) {
+      try {
+        const v = localStorage.getItem(backendStorageKey(net));
+        return v && v.trim() ? v.trim() : null;
+      } catch { return null; }
+    }
+
+    function setBackendOverride(net, url) {
+      try {
+        if (url) localStorage.setItem(backendStorageKey(net), url);
+        else localStorage.removeItem(backendStorageKey(net));
+      } catch { /* storage unavailable -- override just won't persist */ }
+    }
+
+    // Explains WHY a host is blocked (the CSP connect-src allowlist exists so
+    // malicious/compromised code could never exfiltrate addresses or WIFs to
+    // a third party) and HOW to reach a node anyway, without loosening it.
+    const BACKEND_BLOCKED_EXPLANATION =
+      "This page's security policy only allows network connections to itself, " +
+      "mempool.space, and localhost/127.0.0.1 -- so that malicious code could never " +
+      "exfiltrate your addresses or keys to a third-party host. To reach your own node:\n" +
+      "  (a) Tunnel it to localhost, e.g. ssh -L 3006:umbrel.local:3006 user@yournode, " +
+      "then use http://127.0.0.1:3006\n" +
+      "  (b) Self-host these static files on the same origin as your backend " +
+      "(same-origin is always allowed).";
+
+    // Accepts only: same-origin ('self'), https://mempool.space (any path),
+    // or localhost/127.0.0.1 on any port with http or https -- exactly what
+    // the CSP connect-src directive allows. Anything else is rejected here
+    // with an explanation rather than saved and silently blocked later by
+    // the browser's own CSP enforcement.
+    function validateBackendOrigin(urlStr) {
+      const raw = (urlStr || '').trim();
+      if (!raw) return { error: 'Enter a backend URL.' };
+      let u;
+      try { u = new URL(raw); } catch { return { error: 'Enter a valid URL, e.g. http://127.0.0.1:3006/api.' }; }
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        return { error: 'Backend URL must use http:// or https://.' };
+      }
+      const sameOrigin = u.origin === location.origin;
+      const isMempoolSpace = u.protocol === 'https:' && u.hostname === 'mempool.space';
+      const isLocal = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+      if (!sameOrigin && !isMempoolSpace && !isLocal) {
+        return { error: `"${u.origin}" is blocked. ${BACKEND_BLOCKED_EXPLANATION}` };
+      }
+      return { url: raw.replace(/\/+$/, '') };  // trim trailing slash
+    }
+
+    // Quick liveness probe: the same endpoint fetchTipHeight() uses (a plain
+    // integer), stock across mempool.space and esplora. Distinguishes a CSP
+    // block (fetch() rejects with a TypeError, no request ever left the page)
+    // from a reachable-but-wrong server from a timeout.
+    async function probeBackendUrl(base) {
+      try {
+        const resp = await fetch(`${base}/blocks/tip/height`, { signal: AbortSignal.timeout(10000) });
+        if (!resp.ok) return { error: `Backend responded with HTTP ${resp.status}.` };
+        const height = parseInt((await resp.text()).trim(), 10);
+        if (!Number.isInteger(height) || height < 0) {
+          return { error: 'Backend responded, but not with a valid block height -- is it esplora-compatible?' };
+        }
+        return { height };
+      } catch (e) {
+        if (e instanceof TypeError) {
+          return { error: `Request blocked before it left the page. ${BACKEND_BLOCKED_EXPLANATION}` };
+        }
+        if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+          return { error: 'Backend did not respond within 10 seconds.' };
+        }
+        return { error: `Could not reach backend: ${e.message || e}` };
+      }
+    }
+
+    function updateBackendSummary() {
+      const net = document.getElementById('network').value;
+      const override = getBackendOverride(net);
+      const summaryEl = document.getElementById('backendSummary');
+      if (!override) { summaryEl.textContent = 'mempool.space (default)'; return; }
+      try { summaryEl.textContent = new URL(override).host; }
+      catch { summaryEl.textContent = override; }
+    }
+
+    // Loads the saved override (if any) for the currently selected network
+    // into the input -- called at init and on every network switch.
+    function loadBackendForNetwork() {
+      const net = document.getElementById('network').value;
+      document.getElementById('backendUrl').value = getBackendOverride(net) || '';
+      document.getElementById('backendStatus').textContent = '';
+      updateBackendSummary();
+    }
+
+    async function applyBackendOverride() {
+      const net = document.getElementById('network').value;
+      const input = document.getElementById('backendUrl');
+      const statusEl = document.getElementById('backendStatus');
+      const raw = input.value.trim();
+
+      if (!raw) {
+        setBackendOverride(net, null);
+        statusEl.textContent = 'Reset to mempool.space (default).';
+        updateBackendSummary();
+        return;
+      }
+
+      const validated = validateBackendOrigin(raw);
+      if (validated.error) { statusEl.textContent = validated.error; return; }
+
+      statusEl.textContent = 'Checking backend...';
+      const probe = await probeBackendUrl(validated.url);
+      if (probe.error) { statusEl.textContent = `Not saved -- ${probe.error}`; return; }
+
+      setBackendOverride(net, validated.url);
+      input.value = validated.url;
+      statusEl.textContent = `Connected. Chain tip height: ${probe.height}.`;
+      updateBackendSummary();
+    }
+
+    function resetBackendOverride() {
+      const net = document.getElementById('network').value;
+      setBackendOverride(net, null);
+      document.getElementById('backendUrl').value = '';
+      document.getElementById('backendStatus').textContent = 'Reset to mempool.space (default).';
+      updateBackendSummary();
+    }
+
     function getMempoolBaseUrl() {
       const net = document.getElementById('network').value;
+      // An explicit override always wins -- including for regtest+serverMode,
+      // whose '/api' path otherwise takes precedence below.
+      const override = getBackendOverride(net);
+      if (override) return override;
       if (net === 'regtest' && serverMode) return '/api';
       if (net === 'testnet') return 'https://mempool.space/testnet4/api';
       if (net === 'regtest') return 'https://mempool.space/signet/api';
@@ -478,11 +616,47 @@
       // defaults the field to 1 sat/vB).
       if (window.__OFFLINE_BUILD__) return;
       const buttons = document.querySelectorAll('.fee-preset');
+      const base = getMempoolBaseUrl();
+
+      // Primary: mempool.space's /v1/fees/recommended shape.
+      let fees = null;
       try {
-        const base = getMempoolBaseUrl();
         const resp = await fetch(`${base}/v1/fees/recommended`, { signal: AbortSignal.timeout(10000) });
         if (!resp.ok) throw new Error(`Fee API error: ${resp.status}`);
-        const fees = await resp.json();
+        const data = await resp.json();
+        if (typeof data.fastestFee !== 'number' || typeof data.halfHourFee !== 'number'
+          || typeof data.hourFee !== 'number') throw new Error('Unexpected fee response shape');
+        fees = data;
+      } catch {
+        fees = null;
+      }
+
+      // Fallback: stock esplora's /fee-estimates -- a plain JSON map of
+      // confirmation-target (string) -> sat/vB (float), e.g. {"1": 87.9,
+      // "3": ..., "6": ..., "144": ..., "504": ..., "1008": ...}. A custom
+      // backend (electrs, self-hosted esplora) speaks this, not mempool.space's
+      // richer /v1/fees/recommended.
+      if (!fees) {
+        try {
+          const resp = await fetch(`${base}/fee-estimates`, { signal: AbortSignal.timeout(10000) });
+          if (!resp.ok) throw new Error(`fee-estimates error: ${resp.status}`);
+          const est = await resp.json();
+          const at = k => (typeof est[k] === 'number' && isFinite(est[k])) ? est[k] : null;
+          const e1 = at('1'), e3 = at('3'), e6 = at('6'), e144 = at('144'), e1008 = at('1008');
+          if (e1 === null && e3 === null && e6 === null) throw new Error('Unexpected fee-estimates shape');
+          fees = {
+            fastestFee: Math.ceil(e1 ?? e3 ?? e6 ?? 1),
+            halfHourFee: Math.ceil(e3 ?? e1 ?? e6 ?? 1),
+            hourFee: Math.ceil(e6 ?? e3 ?? e1 ?? 1),
+            economyFee: Math.ceil(e144 ?? e6 ?? 1),
+            minimumFee: Math.ceil(e1008 ?? 1),
+          };
+        } catch {
+          fees = null;
+        }
+      }
+
+      if (fees) {
         buttons.forEach(btn => {
           const speed = btn.dataset.speed;
           if (speed === 'fast') btn.textContent = `Fast: ${fees.fastestFee}`;
@@ -496,7 +670,9 @@
           const slowBtn = document.querySelector('.fee-preset[data-speed="slow"]');
           if (slowBtn) slowBtn.click();
         }
-      } catch {
+      } else {
+        // Total failure (both endpoints down/unreachable/unparsable): fall
+        // back to manual entry, same as the pre-existing failure behavior.
         buttons.forEach(btn => {
           btn.textContent = btn.dataset.speed === 'fast' ? 'Fast: N/A'
             : btn.dataset.speed === 'medium' ? 'Med: N/A' : 'Slow: N/A';
@@ -2658,6 +2834,19 @@
     });
     document.getElementById('refreshFees').addEventListener('click', fetchFeeRates);
 
+    // Backend collapsible toggle
+    const backendToggle = document.getElementById('backendToggle');
+    const backendBody = document.getElementById('backendBody');
+    const backendSummaryEl = document.getElementById('backendSummary');
+    const backendChevron = document.getElementById('backendChevron');
+    backendToggle.addEventListener('click', () => {
+      const isOpen = backendBody.style.display !== 'none';
+      backendBody.style.display = isOpen ? 'none' : '';
+      backendChevron.style.transform = isOpen ? 'rotate(-90deg)' : '';
+    });
+    document.getElementById('backendApply').addEventListener('click', applyBackendOverride);
+    document.getElementById('backendResetBtn').addEventListener('click', resetBackendOverride);
+
     // Fee Rate collapsible toggle
     const feeRateToggle = document.getElementById('feeRateToggle');
     const feeRateBody = document.getElementById('feeRateBody');
@@ -2985,6 +3174,7 @@
       previousNetwork = e.target.value;
       rawTxCache.clear();
       refreshAllScriptLabels();
+      loadBackendForNetwork();
       fetchFeeRates().catch(() => {});
       fetchTipHeight();
       updateBroadcastLabel();
@@ -3076,6 +3266,7 @@
     // Initialize step layout and tip visibility
     updateStepLayout();
     updateTipAddress();
+    loadBackendForNetwork();
 
     // Offline build: UI tweaks that don't fit the per-function guards above.
     // Everything here is additive DOM the online page also ships (hidden by
@@ -3089,6 +3280,10 @@
       if (!document.getElementById('feeRate').value) document.getElementById('feeRate').value = '1';
       updateFeeCalc();
       document.getElementById('showFinalTxQr').style.display = '';
+      // No localhost/self backend has any meaning here: Tor Browser on Tails
+      // cannot reach localhost, and this build's CSP is connect-src 'none' --
+      // no network request of any kind can leave the page.
+      document.getElementById('backendGroup').style.display = 'none';
     }
 
     // Test hook — expose internal functions for automated testing
@@ -3143,6 +3338,11 @@
         get serverMode() { return serverMode; },
         set serverMode(v) { serverMode = v; },
         get networkDetected() { return networkDetected; },
+        // Custom backend
+        getBackendOverride, setBackendOverride, validateBackendOrigin,
+        probeBackendUrl, applyBackendOverride, resetBackendOverride,
+        updateBackendSummary, loadBackendForNetwork,
+        get BACKEND_STORAGE_PREFIX() { return BACKEND_STORAGE_PREFIX; },
       };
       window._bitcoin = bitcoin;
       window._Buffer = Buffer;
@@ -3155,6 +3355,8 @@
       document.getElementById('tipChevron').style.transform = '';
       document.getElementById('locktimeBody').style.display = '';
       document.getElementById('locktimeChevron').style.transform = '';
+      document.getElementById('backendBody').style.display = '';
+      document.getElementById('backendChevron').style.transform = '';
       // Tests sign address-fetched inputs with Bitcoin Core (which matches by
       // address), so the software-signer claim is on by default in test mode.
       // Tests of the block itself untick it explicitly.

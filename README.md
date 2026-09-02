@@ -43,6 +43,7 @@ Both approaches work through the same Combine & Finalize step.
 - **CLI signing tool** (`tools/sign-psbt.py`) for hot wallet signing with WIF keys
 - **Network auto-selection** -- Mainnet on GitHub Pages, Testnet4 on local static server, Regtest with regtest server
 - **Network support** for Mainnet, Testnet4, and Regtest
+- **Custom backend** -- point any network at your own esplora-compatible server (electrs, a self-hosted mempool instance, Blockstream esplora) instead of mempool.space, so addresses never leave your network (see [Use your own node](#use-your-own-node) above); restricted to same-origin/mempool.space/localhost by the page's CSP, hidden in the offline build
 - **Step indicator wizard** with two steps (Create → Broadcast) -- the Broadcast step adapts to the inputs: all-WIF sweeps sign inline and go straight to broadcast, hardware-wallet flows show upload/combine first
 - **Guided workflow** with brief instructions under each step
 - **No server required** -- runs entirely in the browser on GitHub Pages
@@ -124,6 +125,21 @@ Use this when the keys live in a hardware or software wallet rather than on pape
 
 **Tip for both flows:** double-check the scriptPubKey you typed -- an input whose script doesn't match its address simply can't be signed, and offline there's no fetch step to catch the typo for you. The Transaction Preview on both steps shows amounts, addresses, and the fee before anything leaves the page.
 
+### Use your own node
+
+Privacy-conscious users can point the app at their own esplora-compatible backend instead of mempool.space, so their addresses never leave their network. Any of these work: [electrs](https://github.com/romanz/electrs), a self-hosted [mempool](https://github.com/mempool/mempool) instance backed by [Fulcrum](https://github.com/cculianu/Fulcrum), or [Blockstream's esplora](https://github.com/Blockstream/electrs) itself.
+
+Open the **Backend** collapsible near the network dropdown, paste your server's base URL (e.g. `http://127.0.0.1:3006/api`), and click **Apply** -- it probes `/blocks/tip/height` and, if reachable, saves the override for the *currently selected network* in `localStorage` (so a regtest override never leaks onto mainnet or vice versa). **Reset** clears it and falls back to mempool.space.
+
+**Only three kinds of origin are accepted:** the page's own origin, `https://mempool.space` (any path), and `localhost`/`127.0.0.1` on any port over http or https. This isn't a UI-only restriction -- it mirrors index.html's `connect-src` Content-Security-Policy directive exactly, so even a compromised or buggy page could never phone home to a third-party host with an address or key. Typing `http://umbrel.local:3006` or any other LAN hostname is rejected with an explanation, because the CSP would silently block the request anyway (a meta CSP can't be loosened at runtime). To reach a node that isn't already on localhost:
+
+- **Tunnel it over SSH** (the easy path, and the one that keeps the CSP as strict as it already is): `ssh -L 3006:umbrel.local:3006 user@yournode`, then point the Backend field at `http://127.0.0.1:3006`.
+- **Self-host these static files** on the same origin as your backend -- same-origin is always allowed, and this is how a fully self-hosted deployment (frontend + electrs behind one reverse proxy) works.
+
+Every other endpoint (`/address/:addr/utxo`, `/tx/:txid/hex`, `POST /tx`, `/blocks/tip/height`) is stock esplora already, so a plain electrs or esplora instance needs no adapter. Fee-rate estimation additionally falls back automatically: the app tries mempool.space's richer `/v1/fees/recommended` first, and if that 404s (a stock esplora backend doesn't serve it) falls back to esplora's plain `/fee-estimates` map (confirmation-target -> sat/vB), synthesizing the same Fast/Med/Slow preset shape from it. If neither endpoint answers, fee entry falls back to manual, same as it always has.
+
+**Tails / offline build:** this feature only makes sense for the **online** build on a normal desktop browser. Tor Browser on Tails can't reach `localhost` at all, and the offline build's CSP is `connect-src 'none'` -- no network request can succeed from it, custom backend or otherwise -- so the whole Backend section is hidden there.
+
 ## Testing
 
 ```bash
@@ -132,7 +148,7 @@ python3 tests/run_all.py             # everything that runs locally
 python3 tests/run_all.py --testnet4  # + the two real-testnet4 Coldcard suites
 python3 tests/run_all.py --list      # show the plan / skip reasons
 
-# Unit tests -- index.html, 403 tests, no bitcoind needed (~45s)
+# Unit tests -- index.html, 428 tests, no bitcoind needed (~45s)
 # Includes building and driving the offline (Tails) single-file build via file://
 python3 tests/test_psbt_builder.py
 
@@ -215,8 +231,11 @@ Every page ships a strict `<meta http-equiv="Content-Security-Policy">` tag. It 
 the code found no exfiltration call" into "no exfiltration connection can succeed, even one a scan
 missed" -- for a page that handles WIF private keys, that's a meaningfully stronger guarantee.
 `index.html`'s online policy allows scripts only from the page's own origin (`script-src 'self'`)
-and network connections only to itself and `https://mempool.space` (`connect-src 'self'
-https://mempool.space`); everything else -- images beyond `data:`/`blob:` canvases, frames beyond
+and network connections only to itself, `https://mempool.space`, and `localhost`/`127.0.0.1` on any
+port over http or https (`connect-src 'self' https://mempool.space http://localhost:*
+http://127.0.0.1:* https://localhost:* https://127.0.0.1:*` -- the last four entries exist for the
+"Use your own node" custom-backend feature above, and are the entire allowlist a custom backend URL
+is validated against); everything else -- images beyond `data:`/`blob:` canvases, frames beyond
 the local `psbt-decoder/` submodule, forms, plugins -- is denied by `default-src 'none'` plus the
 per-directive allowances. A meta CSP forbids inline `<script>` blocks and `onclick="..."`
 attributes, which is why the app's logic lives in `app.js` (loaded via `<script type="module"
