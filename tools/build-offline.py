@@ -15,9 +15,16 @@ index.html's own window.__OFFLINE_BUILD__ guards (see CLAUDE.md's "Offline
 build (Tails)" section) do the rest at runtime.
 
 What gets inlined:
-  - vendor/deps.js and qr_generator.js -> inline <script> blocks (verbatim
-    file contents, with any literal `</script` sequence escaped -- see
-    escape_script_close()).
+  - app.js, vendor/deps.js and qr_generator.js -> inline <script> blocks
+    (verbatim file contents, with any literal `</script` sequence escaped --
+    see escape_script_close()).
+  - index.html's strict online Content-Security-Policy meta tag -> the
+    offline variant (connect-src 'none' -- this build makes zero network
+    requests and, unlike the online page, cannot make any even if a bug
+    tried; script-src/style-src 'unsafe-inline' because every asset above is
+    now an inline block, and the srcdoc decoder iframe below inherits this
+    page's CSP so its inline scripts need it too). See CLAUDE.md's Content
+    Security Policy section for both variants verbatim.
   - assets/favicon.svg -> a data: URI <link>.
   - the psbt-decoder/ git submodule (index.html structure + css/style.css +
     the nine js/*.js files, ALL READ VERBATIM -- the submodule itself is
@@ -58,6 +65,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INDEX_HTML = ROOT / "index.html"
+APP_JS = ROOT / "app.js"
 QR_GENERATOR = ROOT / "qr_generator.js"
 VENDOR_DEPS = ROOT / "vendor" / "deps.js"
 FAVICON = ROOT / "assets" / "favicon.svg"
@@ -66,6 +74,22 @@ DIST_DIR = ROOT / "dist"
 OUT_FILE = DIST_DIR / "dustpan-offline.html"
 
 DONATE_URL = "https://objsal.github.io/dustpan/donate.html"
+
+# index.html's meta CSP (script-src 'self', connect-src limited to mempool.space)
+# is right for a page loaded from a server, but wrong once everything is
+# inlined into one static file: 'self' would forbid running the inline
+# <script> blocks this build produces, and the srcdoc decoder iframe (which
+# inherits this page's CSP) needs its own inline scripts to run too. The
+# offline variant instead locks connect-src to 'none' -- the strongest
+# statement this build can make, since after inlining there is truly no
+# network resource left to fetch.
+CSP_ONLINE = ("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; "
+              "img-src 'self' data: blob:; connect-src 'self' https://mempool.space; "
+              "frame-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'; "
+              "form-action 'none'")
+CSP_OFFLINE = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+               "img-src data: blob:; connect-src 'none'; media-src 'self'; "
+               "object-src 'none'; base-uri 'none'; form-action 'none'")
 
 # Load order matches the <script> tags in psbt-decoder/index.html.
 DECODER_JS_ORDER = [
@@ -231,6 +255,22 @@ def build() -> str:
     html = replace_exact(html, '<script src="vendor/deps.js"></script>',
                           f"<script>\n{vendor_js}\n</script>", "index.html")
 
+    # app.js's own DONATE_HREF is the only *relative* navigation target left
+    # once everything above is inlined -- point it at the real deployment so
+    # it still works if this device happens to be online. Done on the JS
+    # source (before inlining), since the button's click handler now lives
+    # in app.js, not in an onclick="" attribute (CSP forbids inline handlers
+    # on the online page -- see index.html's donateBtn).
+    app_js = read_text(APP_JS)
+    app_js = replace_exact(
+        app_js,
+        "const DONATE_HREF = 'donate.html';",
+        f"const DONATE_HREF = '{DONATE_URL}';",
+        "app.js")
+    app_js = escape_script_close(app_js, "app.js")
+    html = replace_exact(html, '<script type="module" src="app.js"></script>',
+                          f"<script type=\"module\">\n{app_js}\n</script>", "index.html")
+
     favicon_b64 = base64.b64encode(read_text(FAVICON).encode("utf-8")).decode("ascii")
     html = replace_exact(
         html,
@@ -238,14 +278,11 @@ def build() -> str:
         f'<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,{favicon_b64}">',
         "index.html")
 
-    # The donate button is the only *relative* navigation target left once
-    # everything above is inlined -- point it at the real deployment so it
-    # still works if this device happens to be online.
     html = replace_exact(
         html,
-        "onclick=\"window.location.href='donate.html'\"",
-        f"onclick=\"window.location.href='{DONATE_URL}'\"",
-        "index.html")
+        f'content="{CSP_ONLINE}"',
+        f'content="{CSP_OFFLINE}"',
+        "index.html CSP meta tag")
 
     offenders = find_uninlined_local_refs(html)
     if offenders:

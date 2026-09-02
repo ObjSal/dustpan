@@ -3105,6 +3105,88 @@ def run_tests(page, base_url):
 
     offline_page.close()
 
+    # ========================================================
+    section("48. Content Security Policy")
+    # ========================================================
+    # A meta CSP turns "no exfil call found by scanning" into "no exfil
+    # connection can succeed" -- it survives even a scanner bypass. Static
+    # checks below inspect the actual <meta> tag (not a raw grep -- the CSP
+    # doc comment right above it in index.html mentions the policy in prose
+    # and would false-positive a plain substring search); the runtime check
+    # drives a real browser against the real page to prove script-src /
+    # connect-src are actually enforced, not just present as text.
+
+    def _csp_meta_content(html):
+        m = re.search(
+            r'<meta[^>]*http-equiv="Content-Security-Policy"[^>]*content="([^"]*)"',
+            html, re.I)
+        return m.group(1) if m else None
+
+    with open(os.path.join(_PROJECT_ROOT, "index.html"), encoding="utf-8") as f:
+        index_html_src = f.read()
+    index_csp = _csp_meta_content(index_html_src)
+    test("index.html: CSP meta tag present", index_csp is not None)
+    index_csp_directives = dict(
+        d.strip().split(" ", 1) for d in (index_csp or "").split(";") if d.strip())
+    test("index.html: CSP script-src is 'self' (no 'unsafe-inline')",
+         index_csp_directives.get("script-src") == "'self'",
+         index_csp_directives.get("script-src"))
+
+    # No inline <script>...</script> body remains -- only <script src=...>
+    # tags. Strip HTML comments first: index.html's own CSP section documents
+    # the no-inline-script rule with a literal "<script>" example inside a
+    # comment, which would otherwise false-positive this scan.
+    index_html_no_comments = re.sub(r"<!--.*?-->", "", index_html_src, flags=re.S)
+    inline_script_bodies = [
+        body for body in re.findall(
+            r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>",
+            index_html_no_comments, re.S | re.I)
+        if body.strip()
+    ]
+    test("index.html: no inline <script> body remains (app logic lives in app.js)",
+         inline_script_bodies == [], f"{len(inline_script_bodies)} inline script body(ies) found")
+
+    # offline_html_path was built fresh by section 47, above.
+    with open(offline_html_path, encoding="utf-8") as f:
+        offline_html_src = f.read()
+    offline_csp = _csp_meta_content(offline_html_src)
+    test("offline build: CSP meta tag present", offline_csp is not None)
+    test("offline build: CSP connect-src is 'none' (zero network resources left after inlining)",
+         "connect-src 'none'" in (offline_csp or ""), offline_csp)
+
+    # --- runtime: drive a real page and prove the policy is actually
+    #     enforced by the browser, not just present as text in <head>. ---
+    csp_page = page.context.new_page()
+    csp_page.add_init_script("window.__TEST_MODE__ = true;")
+    csp_page.goto(base_url)
+    csp_page.wait_for_function("() => window._fn !== undefined", timeout=10000)
+
+    csp_result = csp_page.evaluate("""async () => {
+        let crossOriginBlocked = false;
+        try {
+            await fetch('https://example.com/csp-probe');
+        } catch (e) {
+            crossOriginBlocked = true;
+        }
+        let sameOriginThrew = false;
+        try {
+            await fetch('/nonexistent-path-csp-probe');
+        } catch (e) {
+            sameOriginThrew = true;
+        }
+        return { crossOriginBlocked, sameOriginThrew };
+    }""")
+    test("runtime: cross-origin fetch() is blocked by CSP (connect-src)",
+         csp_result.get("crossOriginBlocked") is True, csp_result)
+    test("runtime: same-origin fetch() to a missing path is NOT blocked by CSP "
+         "(may 404, but must not throw a TypeError)",
+         csp_result.get("sameOriginThrew") is False, csp_result)
+    test("runtime: window._fn still exposes after the app.js extraction "
+         "(add_init_script runs before the page's CSP-governed scripts, so the test hook survives)",
+         csp_page.evaluate("() => typeof window._fn === 'object'"))
+
+    csp_page.close()
+
 
 # ============================================================
 # Main

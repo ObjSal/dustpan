@@ -18,8 +18,9 @@ allowlisted line is safe). If you add a new dependency and the audit starts fail
 the matched line yourself before touching ALLOWLIST -- a reachable fetch()/postMessage()/etc.
 is a real problem to report, not something to allowlist away.
 
-FIRST-PARTY FILES (index.html, qr_generator.js, tools/qr-scanner.html): when scanned by name
-(see FIRST_PARTY_BASENAMES), a separate, much smaller FIRST_PARTY_PATTERNS table is used instead
+FIRST-PARTY FILES (index.html, app.js, qr_generator.js, donate.js, tools/qr-scanner.html,
+tools/qr-scanner.js): when scanned by name (see FIRST_PARTY_BASENAMES), a separate, much
+smaller FIRST_PARTY_PATTERNS table is used instead
 of PATTERNS -- these files legitimately call fetch/localStorage/getUserMedia/etc. themselves, so
 the vendor table would be one long false-positive list. FIRST_PARTY_PATTERNS only names
 primitives the app has no legitimate reason to ever use; a hit there is never allowlisted -- it
@@ -51,13 +52,23 @@ DEFAULT_FILES = [
     ROOT / "vendor" / "jsqr.js",
     # First-party files are scanned with the smaller FIRST_PARTY_PATTERNS table
     # (see below); including them here means every routine build exercises it.
+    # index.html itself now carries ~no JS (just the <script src> tags and the
+    # CSP meta tag) since app.js was extracted, but it stays listed -- a stray
+    # inline script slipping back in is exactly the kind of regression this
+    # scan should catch.
     ROOT / "index.html",
+    ROOT / "app.js",
     ROOT / "qr_generator.js",
+    ROOT / "donate.js",
     ROOT / "tools" / "qr-scanner.html",
+    ROOT / "tools" / "qr-scanner.js",
 ]
 
 # Basenames scanned with FIRST_PARTY_PATTERNS instead of PATTERNS -- see the module docstring.
-FIRST_PARTY_BASENAMES = {"index.html", "qr_generator.js", "qr-scanner.html"}
+FIRST_PARTY_BASENAMES = {
+    "index.html", "app.js", "qr_generator.js", "donate.js",
+    "qr-scanner.html", "qr-scanner.js",
+}
 
 # --------------------------------------------------------------------------------------
 # pattern table (exactly the patterns named in the task spec)

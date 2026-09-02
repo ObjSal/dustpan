@@ -94,7 +94,7 @@ gpg --verify dustpan-offline.html.asc dustpan-offline.html  # authenticity, if y
 
 **Get it onto Tails:** copy `dustpan-offline.html` (and its `.sha256`/`.asc` if you built `--release`) to a USB drive, then copy it from the USB drive into your Tails **Home** or **Persistent Storage** folder -- Tor Browser's sandbox can't read arbitrary USB mount paths directly. Open it with `File → Open File...` (a `file://` URL). Tor Browser's **Security Level** must be **Standard** or **Safer** -- **Safest disables JavaScript**, and this is a JavaScript wallet, so it can't run at all under Safest.
 
-**What's different offline:** an **OFFLINE** badge appears next to the title; the network defaults to Mainnet with no server probe; the "Fetch Unspent" row is replaced with a hint to add inputs manually (`+ Add Input`: txid/vout/value/scriptPubKey) or build the PSBT elsewhere and sign it here; the fee rate is manual-only (defaults to 1 sat/vB); lock time still defaults to Block mode but you type the current height yourself (no tip-height fetch); and the Broadcast step drops the mempool.space POST for a QR code of the raw transaction (BBQr, same pipeline as PSBT display) plus the existing Download button, so you can move the finished transaction to any online device to actually broadcast it. Manual UTXO/output entry, WIF signing, and PSBT upload/scan/combine all keep working exactly as online -- they never needed a network. See `CLAUDE.md`'s "Offline build (Tails)" architecture notes for the guard-by-guard breakdown.
+**What's different offline:** an **OFFLINE** badge appears next to the title; the network defaults to Mainnet with no server probe; the "Fetch Unspent" row is replaced with a hint to add inputs manually (`+ Add Input`: txid/vout/value/scriptPubKey) or build the PSBT elsewhere and sign it here; the fee rate is manual-only (defaults to 1 sat/vB); lock time still defaults to Block mode but you type the current height yourself (no tip-height fetch); and the Broadcast step drops the mempool.space POST for a QR code of the raw transaction (BBQr, same pipeline as PSBT display) plus the existing Download button, so you can move the finished transaction to any online device to actually broadcast it. Manual UTXO/output entry, WIF signing, and PSBT upload/scan/combine all keep working exactly as online -- they never needed a network. The offline file also carries a stricter Content-Security-Policy than the online page (`connect-src 'none'`) -- see "Content Security Policy" below -- so nothing in it can make a network connection even if something tried. See `CLAUDE.md`'s "Offline build (Tails)" architecture notes for the guard-by-guard breakdown.
 
 #### Example 1 -- sweep a paper wallet, fully air-gapped (the WIF never touches an online machine)
 
@@ -132,7 +132,7 @@ python3 tests/run_all.py             # everything that runs locally
 python3 tests/run_all.py --testnet4  # + the two real-testnet4 Coldcard suites
 python3 tests/run_all.py --list      # show the plan / skip reasons
 
-# Unit tests -- index.html, 395 tests, no bitcoind needed (~45s)
+# Unit tests -- index.html, 403 tests, no bitcoind needed (~45s)
 # Includes building and driving the offline (Tails) single-file build via file://
 python3 tests/test_psbt_builder.py
 
@@ -209,9 +209,27 @@ python3 tools/sign-psbt.py unsigned.psbt <WIF-private-key>
 - [ckcc-protocol](https://github.com/Coldcard/ckcc-protocol): `pip install ckcc-protocol` (for real Coldcard MK4 tests only)
 - Bitcoin Core v30+ (for regtest E2E tests only)
 
+## Content Security Policy
+
+Every page ships a strict `<meta http-equiv="Content-Security-Policy">` tag. It turns "a scan of
+the code found no exfiltration call" into "no exfiltration connection can succeed, even one a scan
+missed" -- for a page that handles WIF private keys, that's a meaningfully stronger guarantee.
+`index.html`'s online policy allows scripts only from the page's own origin (`script-src 'self'`)
+and network connections only to itself and `https://mempool.space` (`connect-src 'self'
+https://mempool.space`); everything else -- images beyond `data:`/`blob:` canvases, frames beyond
+the local `psbt-decoder/` submodule, forms, plugins -- is denied by `default-src 'none'` plus the
+per-directive allowances. A meta CSP forbids inline `<script>` blocks and `onclick="..."`
+attributes, which is why the app's logic lives in `app.js` (loaded via `<script type="module"
+src="app.js">`) instead of inline, and why the donate button's navigation is wired up with
+`addEventListener` in `app.js` rather than an inline handler. `tools/build-offline.py` swaps in an
+even stricter policy for the offline build -- `connect-src 'none'` -- since once everything is
+inlined into one file for Tails, there is genuinely no network resource left for it to reach. See
+`CLAUDE.md`'s "Content Security Policy" section for the exact directive strings for every page and
+the reasoning behind each one.
+
 ## Tech Stack
 
-- **Frontend**: `index.html` (sweeper) + `donate.html`, no build step
+- **Frontend**: `index.html` + `app.js` (sweeper) + `donate.html` + `donate.js`, no build step. A strict `Content-Security-Policy` meta tag on every page (`script-src 'self'`, no inline scripts) is why the app logic lives in `app.js` rather than inline — see "Content Security Policy" above.
 - **JS Libraries** (vendored locally into `vendor/deps.js`/`vendor/jsqr.js`, built from hash-pinned npm tarballs — see `vendor/pins.json`): [bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) v7.0.1, [bip32](https://github.com/bitcoinjs/bip32) v5.0.1, [bs58check](https://github.com/bitcoinjs/bs58check) v3.0.1, [ecpair](https://github.com/bitcoinjs/ecpair) v3.0.0, [bbqr](https://github.com/coinkite/BBQr), [jsQR](https://github.com/cozmo/jsQR)
 - **QR Generator**: Custom `qr_generator.js` (shared with [bitcoin-gift-paper-wallet](https://github.com/ObjSal/bitcoin-gift-paper-wallet))
 - **Dev Server**: Python stdlib (`http.server`) + Bitcoin Core RPC
