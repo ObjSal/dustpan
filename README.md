@@ -75,6 +75,8 @@ The server provides a faucet and auto-mining, and exposes mempool.space-compatib
 
 Tor Browser on [Tails](https://tails.net/) can't reach `localhost` (no dev server) and can't install a PWA, so the offline deliverable is **one self-contained HTML file** opened straight from disk (`file://`) -- no server, no install. UTXOs and PSBTs move by manual entry, file upload, or QR code only; everything that needs a network call (fetching UTXOs by address/xpub, fee-rate/tip-height lookups, broadcasting) is disabled or replaced with a manual hand-off.
 
+**Download it (recommended):** every tagged release on the [Releases page](https://github.com/ObjSal/dustpan/releases) ships `dustpan-offline.html` with a `.sha256` checksum and a GPG detached signature (`.asc`) -- grab the latest, then jump to *Verify before trusting it* below. Building it yourself from a reviewed checkout is the more paranoid alternative:
+
 **Build it:**
 
 ```bash
