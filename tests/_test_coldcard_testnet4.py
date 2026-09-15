@@ -8,7 +8,7 @@ returning all funds (minus fee) to the testnet4 wallet.
 Requires:
   - Coldcard MK4 plugged in and set to XTN, OR the Coldcard simulator
     (github.com/Coldcard/firmware checkout; set COLDCARD_FIRMWARE, default
-    ~/Projects/coldcard-firmware). The simulator is preferred when present;
+    ~/projects/coldcard-firmware). The simulator is preferred when present;
     force the physical device with COLDCARD_PHYSICAL=1.
   - ckcc CLI: pip install ckcc-protocol
   - embit: pip install embit

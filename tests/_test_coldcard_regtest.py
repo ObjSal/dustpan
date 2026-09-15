@@ -6,7 +6,7 @@ Requires:
   - Coldcard MK4 plugged in and unlocked
   - ckcc CLI: pip install ckcc-protocol
   - Coldcard simulator (github.com/Coldcard/firmware; COLDCARD_FIRMWARE env,
-    default ~/Projects/coldcard-firmware) OR a real MK4 with
+    default ~/projects/coldcard-firmware) OR a real MK4 with
     COLDCARD_PHYSICAL=1. The simulator is auto-launched, auto-switched to
     XRT, and transactions are approved automatically.
   - bitcoind/bitcoin-cli in PATH

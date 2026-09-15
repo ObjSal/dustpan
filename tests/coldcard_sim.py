@@ -17,7 +17,7 @@ Selection:
   - otherwise                  -> simulator if its socket is live or it can
                                   be launched from COLDCARD_FIRMWARE
   - COLDCARD_FIRMWARE          -> firmware checkout (default
-                                  ~/Projects/coldcard-firmware)
+                                  ~/projects/coldcard-firmware)
 """
 import os
 import subprocess
@@ -26,7 +26,7 @@ import time
 
 SIM_SOCKET = "/tmp/ckcc-simulator.sock"
 FIRMWARE_DIR = os.environ.get(
-    "COLDCARD_FIRMWARE", os.path.expanduser("~/Projects/coldcard-firmware"))
+    "COLDCARD_FIRMWARE", os.path.expanduser("~/projects/coldcard-firmware"))
 
 _started_proc = None
 
